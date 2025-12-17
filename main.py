@@ -292,6 +292,12 @@ class Mnemosyne(Star):
             self.summary_time_threshold: int = summary_check_config.get(
                 "SUMMARY_TIME_THRESHOLD_SECONDS", DEFAULT_SUMMARY_TIME_THRESHOLD_SECONDS
             )
+            
+            # [Optimization] Initialize concurrency semaphore from config
+            max_concurrent = summary_check_config.get("max_concurrent_tasks", 3)
+            self.summary_semaphore = asyncio.Semaphore(max_concurrent)
+            logger.info(f"记忆总结任务最大并发数已设置为: {max_concurrent}")
+
             if self.summary_time_threshold <= 0:
                 logger.warning(
                     f"配置的 SUMMARY_TIME_THRESHOLD_SECONDS ({self.summary_time_threshold}) 无效，将禁用基于时间的自动总结。"
@@ -410,7 +416,7 @@ class Mnemosyne(Star):
             raise
 
     # --- 事件处理钩子 (调用 memory_operations.py 中的实现) ---
-    @filter.on_llm_request()
+    @filter.on_llm_request(priority=100)
     async def query_memory(self, event: AstrMessageEvent, req: ProviderRequest):
         """[事件钩子] 在 LLM 请求前，查询并注入长期记忆。"""
         # 当会话第一次发生时，插件会从AstrBot中获取上下文历史，之后的会话历史由插件自动管理
