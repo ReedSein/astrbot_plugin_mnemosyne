@@ -77,6 +77,15 @@
                 "obvious_hint":true,
                 "default":-1,
                 "minimum":-1
+            },
+            "max_concurrent_tasks":{
+                "description":"最大并发总结任务数",
+                "type":"int",
+                "hint":"限制同时进行的记忆总结任务数量，防止瞬间并发过高导致 LLM API 报错 (429)。建议默认为 3",
+                "obvious_hint":true,
+                "default":3,
+                "minimum":1,
+                "maximum":50
             }
         }
     },
@@ -127,8 +136,8 @@
     "memory_injection_method":{
         "description":"记忆插入方式",
         "type":"string",
-        "hint":"user_prompt 会嵌入到用户消息的最前面，system_prompt会嵌入到系统消息中，insert_system_prompt会向上下文列表中添加一条新的系统消息",
-        "options": ["user_prompt", "system_prompt", "insert_system_prompt"],
+        "hint":"user_prompt 嵌入用户消息前，system_prompt 嵌入系统消息，insert_system_prompt 添加新系统消息，state_only 仅挂载变量不自动注入",
+        "options": ["user_prompt", "system_prompt", "insert_system_prompt", "state_only"],
         "default": "user_prompt"
     },
     "long_memory_prompt":{
