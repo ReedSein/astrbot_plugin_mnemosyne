@@ -51,9 +51,16 @@ async def handle_query_memory(
 
     # --- 前置检查 ---
     if not await _check_rag_prerequisites(plugin):
+        # [Fallback] 即使前置检查失败，也要确保重置当前会话的记忆缓存，防止脏读
+        if hasattr(plugin, "set_memory_data"):
+            plugin.set_memory_data(event.unified_msg_origin, "")
         return
 
     try:
+        # [Init] 初始化缓存为空，确保默认安全
+        if hasattr(plugin, "set_memory_data"):
+            plugin.set_memory_data(event.unified_msg_origin, "")
+
         # --- 获取会话和人格信息 ---
         persona_id = await _get_persona_id(plugin, event)
         # 直接使用 unified_msg_origin 作为 session_id，确保多Bot场景下的记忆隔离
@@ -573,10 +580,12 @@ def _format_and_inject_memory(
     logger.info(f"📝 {preview_content}")
     logger.info("="*50)
 
-    # [新增] 将记忆数据挂载到 event.state，供下游插件（如 SpectreCore）使用
-    if not hasattr(event, "state"):
-        event.state = {}
-    event.state["mnemosyne_data"] = long_memory
+    # [Fix] 使用插件共享缓存替代 event.state，避免 AttributeError
+    # 直接使用 unified_msg_origin 作为 session_id
+    if hasattr(plugin, "set_memory_data"):
+        plugin.set_memory_data(event.unified_msg_origin, long_memory)
+    else:
+        logger.error("Mnemosyne 实例缺少 set_memory_data 方法，记忆无法传递！")
 
     injection_method = plugin.config.get("memory_injection_method", "user_prompt")
 
