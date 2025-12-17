@@ -185,6 +185,7 @@ def format_context_to_string(
     """
     从上下文历史记录中提取最后 'length' 条用户和AI的对话消息，
     并将它们的内容转换为用换行符分隔的字符串。
+    如果包含 timestamp，则会带上时间戳。
     """
     if length <= 0:
         return ""
@@ -198,20 +199,26 @@ def format_context_to_string(
 
         role = None
         content = None
+        timestamp = None
 
-        if isinstance(message, dict) and "role" in message and "content" in message:
+        if isinstance(message, dict):
             role = message.get("role")
             content = message.get("content")
+            timestamp = message.get("timestamp")
 
         if content is not None:
-            if role == "user":
-                selected_contents.insert(0, str("user:" + str(content) + "\n"))
-                count += 1
-            elif role == "assistant":
-                selected_contents.insert(0, str("assistant:" + str(content) + "\n"))
-                count += 1
+            # 构建单条消息文本
+            msg_line = ""
+            if timestamp:
+                msg_line += f"[{timestamp}] "
+            
+            msg_line += f"{role}: {content}\n"
+            
+            # 插入到列表头部（因为是倒序遍历）
+            selected_contents.insert(0, msg_line)
+            count += 1
 
-    return "\n".join(selected_contents)
+    return "".join(selected_contents)
 
 
 def is_group_chat(event: AstrMessageEvent) -> bool:
