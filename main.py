@@ -72,12 +72,22 @@ class Mnemosyne(Star):
         self._embedding_provider_ready = False
         self._migrated_sessions: set[str] = set()  # 用于记录已迁移的会话
 
+        # [Global Data Sharing] 插件间数据共享缓存
+        # 替代不稳定的 event.state
+        self.memory_cache: dict[str, str] = {}
+
         logger.info("开始初始化 Mnemosyne 插件...")
         # 启动后台异步初始化，但不包括 Embedding Provider 的初始化
         asyncio.create_task(self._initialize_plugin_async())
 
-        # 延迟加载 Embedding Provider，只在需要时才加载
-        self._embedding_provider_task = None
+    # [Public API] 供 SpectreCore 调用的公开接口 (Robust Access)
+    def get_memory_data(self, session_id: str) -> str:
+        """安全获取指定会话的记忆数据，无数据则返回空字符串"""
+        return self.memory_cache.get(session_id, "")
+
+    def set_memory_data(self, session_id: str, data: str):
+        """设置记忆数据"""
+        self.memory_cache[session_id] = data
 
     def _initialize_embedding_provider(
         self, silent: bool = False
