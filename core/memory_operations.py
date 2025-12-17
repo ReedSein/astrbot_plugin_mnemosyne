@@ -156,7 +156,7 @@ async def handle_query_memory(
 
             # 3. 格式化结果并注入到提示中
             if detailed_results:
-                _format_and_inject_memory(plugin, detailed_results, req)
+                _format_and_inject_memory(plugin, detailed_results, req, event)
 
         except Exception as e:
             logger.error(f"处理长期记忆 RAG 查询时发生错误: {e}", exc_info=True)
@@ -306,6 +306,14 @@ async def _check_and_trigger_summary(
         task = asyncio.create_task(
             handle_summary_long_memory(plugin, persona_id, session_id, history_contents)
         )
+
+        # [Visual Log] 显式日志：对话轮数触发总结
+        logger.info("="*40)
+        logger.info(f"⏰ [Mnemosyne] 触发记忆总结 (机制: 对话轮数)")
+        logger.info(f"📊 当前计数: {plugin.msg_counter.get_counter(session_id)}")
+        logger.info(f"🎯 触发阈值: {num_pairs * 2} (即 {num_pairs} 轮)")
+        logger.info(f"🆔 Session: {session_id}")
+        logger.info("="*40)
 
         def task_done_callback(t: asyncio.Task):
             """后台任务完成时的回调，用于捕获未处理的异常"""
@@ -510,7 +518,7 @@ def _process_milvus_hits(hits) -> list[dict[str, Any]]:
 
 # LLM 响应处理相关函数
 def _format_and_inject_memory(
-    plugin: "Mnemosyne", detailed_results: list[dict], req: ProviderRequest
+    plugin: "Mnemosyne", detailed_results: list[dict], req: ProviderRequest, event: AstrMessageEvent
 ):
     """
     格式化搜索结果并注入到 ProviderRequest 中。
@@ -519,6 +527,7 @@ def _format_and_inject_memory(
         plugin: Mnemosyne 插件实例。
         detailed_results: 详细的搜索结果列表。
         req: ProviderRequest 对象。
+        event: 消息事件对象 (用于挂载 state)。
     """
     # logger = plugin.logger
     if not detailed_results:
@@ -550,13 +559,35 @@ def _format_and_inject_memory(
 
     long_memory += long_memory_suffix
 
-    logger.info(f"补充了 {len(detailed_results)} 条长期记忆到提示中。")
-    logger.debug(f"补充内容:\n{long_memory}")
+    # [Visual Log] 结构化展示记忆检索结果
+    logger.info("="*50)
+    logger.info(f"🧠 [Mnemosyne] 记忆检索成功")
+    logger.info(f"📊 命中数量: {len(detailed_results)} 条")
+    logger.info(f"🔗 注入模式: {plugin.config.get('memory_injection_method', 'user_prompt')}")
+    logger.info("-" * 20 + " 记忆片段预览 " + "-" * 20)
+    
+    preview_len = 100
+    preview_content = long_memory.replace("\n", " ")
+    if len(preview_content) > preview_len:
+        preview_content = preview_content[:preview_len] + "..."
+    logger.info(f"📝 {preview_content}")
+    logger.info("="*50)
+
+    # [新增] 将记忆数据挂载到 event.state，供下游插件（如 SpectreCore）使用
+    if not hasattr(event, "state"):
+        event.state = {}
+    event.state["mnemosyne_data"] = long_memory
 
     injection_method = plugin.config.get("memory_injection_method", "user_prompt")
 
     # 清理插入的长期记忆内容
     clean_contexts(plugin, req)
+    
+    # [新增] state_only 模式：只挂载变量，不修改 prompt，避免重复
+    if injection_method == "state_only":
+        logger.info("检测到注入模式为 'state_only'，已跳过 Prompt 自动注入。")
+        return
+
     if injection_method == "user_prompt":
         req.prompt = long_memory + "\n" + req.prompt
 
@@ -815,57 +846,62 @@ async def handle_summary_long_memory(
     """
     # logger = plugin.logger
 
-    # --- 前置检查 ---
-    if not await _check_summary_prerequisites(plugin, memory_text):
-        return
-
-    try:
-        # 1. 请求 LLM 进行总结
-        llm_response = await _get_summary_llm_response(plugin, memory_text)
-        if not llm_response:
+    # [Optimization] Acquire semaphore from plugin instance to limit concurrency
+    # Fallback to a temporary semaphore if not initialized (though it should be)
+    semaphore = getattr(plugin, "summary_semaphore", asyncio.Semaphore(3))
+    
+    async with semaphore:
+        # --- 前置检查 ---
+        if not await _check_summary_prerequisites(plugin, memory_text):
             return
 
-        # 2. 提取总结文本
-        summary_text = _extract_summary_text(plugin, llm_response)
-        if not summary_text:
-            return
-
-        # 3. 获取总结文本的 Embedding
-        # 使用 AstrBot EmbeddingProvider（异步）
         try:
-            if not plugin.embedding_provider:
-                logger.error("Embedding Provider 不可用，无法获取总结的 Embedding")
+            # 1. 请求 LLM 进行总结
+            llm_response = await _get_summary_llm_response(plugin, memory_text)
+            if not llm_response:
                 return
 
-            # 使用 AstrBot EmbeddingProvider 的 get_embedding 方法
-            embedding_vector = await plugin.embedding_provider.get_embedding(
-                summary_text
-            )
-
-            if not embedding_vector:
-                logger.error(f"无法获取总结文本的 Embedding: '{summary_text[:100]}...'")
+            # 2. 提取总结文本
+            summary_text = _extract_summary_text(plugin, llm_response)
+            if not summary_text:
                 return
 
-        except (ConnectionError, ValueError, RuntimeError) as e:
-            logger.error(
-                f"获取总结文本 Embedding 时出错: '{summary_text[:100]}...' - {e}",
-                exc_info=True,
+            # 3. 获取总结文本的 Embedding
+            # 使用 AstrBot EmbeddingProvider（异步）
+            try:
+                if not plugin.embedding_provider:
+                    logger.error("Embedding Provider 不可用，无法获取总结的 Embedding")
+                    return
+
+                # 使用 AstrBot EmbeddingProvider 的 get_embedding 方法
+                embedding_vector = await plugin.embedding_provider.get_embedding(
+                    summary_text
+                )
+
+                if not embedding_vector:
+                    logger.error(f"无法获取总结文本的 Embedding: '{summary_text[:100]}...'")
+                    return
+
+            except (ConnectionError, ValueError, RuntimeError) as e:
+                logger.error(
+                    f"获取总结文本 Embedding 时出错: '{summary_text[:100]}...' - {e}",
+                    exc_info=True,
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    f"获取总结文本 Embedding 时发生未知错误: '{summary_text[:100]}...' - {e}",
+                    exc_info=True,
+                )
+                return
+
+            # 4. 存储到 Milvus
+            await _store_summary_to_milvus(
+                plugin, persona_id, session_id, summary_text, embedding_vector
             )
             return
         except Exception as e:
-            logger.error(
-                f"获取总结文本 Embedding 时发生未知错误: '{summary_text[:100]}...' - {e}",
-                exc_info=True,
-            )
-            return
-
-        # 4. 存储到 Milvus
-        await _store_summary_to_milvus(
-            plugin, persona_id, session_id, summary_text, embedding_vector
-        )
-        return
-    except Exception as e:
-        logger.error(f"在总结或存储长期记忆的过程中发生严重错误: {e}", exc_info=True)
+            logger.error(f"在总结或存储长期记忆的过程中发生严重错误: {e}", exc_info=True)
 
 
 # 计时器
@@ -917,9 +953,16 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
 
                     if current_time - last_summary_time > plugin.summary_time_threshold:
                         # logger.debug(f"current_time {current_time} - last_summary_time {last_summary_time} : {current_time - last_summary_time}")
-                        logger.info(
-                            f"会话 {session_id} 距离上次总结已超过阈值 ({plugin.summary_time_threshold}秒)，触发强制总结。"
-                        )
+                        
+                        # [Visual Log] 显式日志：时间阈值触发总结
+                        time_diff = int(current_time - last_summary_time)
+                        logger.info("="*40)
+                        logger.info(f"⏰ [Mnemosyne] 触发记忆总结 (机制: 定时任务)")
+                        logger.info(f"⌛ 距上次总结: {time_diff} 秒")
+                        logger.info(f"🎯 超时阈值: {plugin.summary_time_threshold} 秒")
+                        logger.info(f"🆔 Session: {session_id}")
+                        logger.info("="*40)
+                        
                         # 运行总结
                         logger.info("开始总结历史对话...")
                         # M24 修复: 添加 msg_counter 的类型检查和类型忽略
