@@ -646,6 +646,16 @@ class Mnemosyne(Star):
             yield result
         return
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @memory_group.command("debug_summary")  # type: ignore
+    async def debug_summary_cmd(self, event: AstrMessageEvent):
+        """[管理员] 强制触发当前会话的记忆总结与入库 (调试用)
+        使用示例：/memory debug_summary
+        """
+        async for result in commands.debug_summary_cmd_impl(self, event):
+            yield result
+        return
+
     # --- 插件生命周期方法 ---
     def _cleanup_partial_initialization(self):
         """
