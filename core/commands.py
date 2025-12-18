@@ -1,4 +1,4 @@
-﻿# Mnemosyne 插件的命令处理函数实现
+# Mnemosyne 插件的命令处理函数实现
 # (注意：装饰器已移除，函数接收 self)
 
 import json
@@ -723,3 +723,56 @@ async def init_memory_system_cmd_impl(
     except Exception as e:
         logger.error(f"执行 'memory init' 命令失败: {str(e)}", exc_info=True)
         yield event.plain_result(f"⚠️ 初始化失败: {str(e)}")
+
+
+async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
+    """[实现] 强制触发当前会话的记忆总结（调试模式，含数据库写入）"""
+    session_id = event.unified_msg_origin
+    if not session_id:
+        yield event.plain_result("⚠️ 无法获取 Session ID，无法执行调试。")
+        return
+
+    logger.info(f"🔧 [Debug] 开始对 Session: {session_id} 执行强制总结...")
+    
+    # 1. 获取会话上下文
+    if not self.context_manager:
+        yield event.plain_result("⚠️ Context Manager 未初始化。")
+        return
+    
+    # 获取所有历史
+    history_list = self.context_manager.get_history(session_id)
+    if not history_list:
+        yield event.plain_result("⚠️ 当前会话历史为空，无法总结。")
+        return
+        
+    yield event.plain_result(f"🔍 正在读取最近 {len(history_list)} 条历史记录...")
+
+    # 2. 格式化历史 (Input)
+    from .tools import format_context_to_string
+    # 传递足够大的轮数以包含所有历史
+    history_str = format_context_to_string(history_list, len(history_list) * 2)
+    
+    logger.info("="*20 + " [Debug] History Input " + "="*20)
+    logger.info(history_str)
+    logger.info("="*60)
+
+    # 3. 获取 Persona ID
+    from .memory_operations import _get_persona_id, handle_summary_long_memory
+    persona_id = await _get_persona_id(self, event)
+
+    yield event.plain_result("⏳ 正在执行总结流水线 (生成 -> 向量化 -> 存储)...")
+    
+    try:
+        # 直接调用核心业务函数，复用其内部的所有逻辑（包括 embedding 和 milvus insert）
+        # 注意：这是一个后台任务函数，这里我们需要 await 它
+        await handle_summary_long_memory(self, persona_id, session_id, history_str)
+        
+        yield event.plain_result(
+            "✅ 总结流程执行完毕！\n"
+            "请检查控制台日志确认 LLM 输出内容。\n"
+            "验证方法：请执行 `/memory list_records` 查看最新的一条记录是否为刚才生成的总结。"
+        )
+        
+    except Exception as e:
+        logger.error(f"Debug 总结过程出错: {e}", exc_info=True)
+        yield event.plain_result(f"❌ 发生异常: {e}")
