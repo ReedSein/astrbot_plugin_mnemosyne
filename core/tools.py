@@ -184,41 +184,82 @@ def format_context_to_string(
 ) -> str:
     """
     从上下文历史记录中提取最后 'length' 条用户和AI的对话消息，
-    并将它们的内容转换为用换行符分隔的字符串。
-    如果包含 timestamp，则会带上时间戳。
+    并将它们的内容转换为结构化的字符串，明确标注角色和时间戳（如果可用）。
     """
-    if length <= 0:
+    if length <= 0 or not context_history:
         return ""
 
     selected_contents: list[str] = []
     count = 0
 
+    # 倒序遍历，从最新的消息开始提取
     for message in reversed(context_history):
         if count >= length:
             break
 
-        role = None
-        content = None
-        timestamp = None
+        role = "Unknown"
+        content = ""
+        timestamp_str = ""
 
         if isinstance(message, dict):
-            role = message.get("role")
-            content = message.get("content")
-            timestamp = message.get("timestamp")
+            # 1. 尝试获取发送者名称 (Multi-User Attribution)
+            sender_name = message.get("name")
+            
+            raw_role = message.get("role", "").lower()
+            # 明确映射角色名称，避免混淆
+            if raw_role in ["user", "human"]:
+                # 如果有具体名字，优先使用名字
+                role = sender_name if sender_name else "User"
+            elif raw_role in ["assistant", "model", "ai"]:
+                role = "Rosa"
+            elif raw_role == "system":
+                continue # 跳过系统提示，专注于对话历史
+            else:
+                role = raw_role.capitalize() if raw_role else "Unknown"
 
-        if content is not None:
-            # 构建单条消息文本
-            msg_line = ""
-            if timestamp:
-                msg_line += f"[{timestamp}] "
+            content_obj = message.get("content", "")
+            # 处理多模态内容列表
+            if isinstance(content_obj, list):
+                text_parts = []
+                for part in content_obj:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(str(part.get("text", "")))
+                content = "".join(text_parts)
+            else:
+                content = str(content_obj)
             
-            msg_line += f"{role}: {content}\n"
+            # 尝试获取时间戳
+            ts = message.get("timestamp") or message.get("created_at") or message.get("time")
+            if ts:
+                # 简单格式化，假设是字符串或时间戳对象
+                timestamp_str = f"[{ts}] "
+            else:
+                # 如果没有时间戳，留空
+                timestamp_str = ""
+
+        elif hasattr(message, "role") and hasattr(message, "content"):
+             # 处理对象类型的消息 (如 AstrBot 的 MessageSegment)
+            raw_role = getattr(message, "role", "").lower()
             
-            # 插入到列表头部（因为是倒序遍历）
+            # 尝试从对象属性中获取 name
+            sender_name = getattr(message, "name", None)
+            
+            if raw_role == "user": 
+                role = sender_name if sender_name else "User"
+            elif raw_role == "assistant": 
+                role = "Rosa"
+            else: role = "Unknown"
+            
+            content = str(getattr(message, "content", ""))
+            timestamp_str = "" # 对象通常不带时间戳，除非我们去查库
+
+        if content:
+            # 构建单条结构化消息: [Time] Role: Content
+            msg_line = f"{timestamp_str}{role}: {content}"
             selected_contents.insert(0, msg_line)
             count += 1
 
-    return "".join(selected_contents)
+    return "\n".join(selected_contents)
 
 
 def is_group_chat(event: AstrMessageEvent) -> bool:
