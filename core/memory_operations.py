@@ -278,6 +278,168 @@ async def _get_persona_id(plugin: "Mnemosyne", event: AstrMessageEvent) -> str |
     return persona_id
 
 
+async def _try_fetch_roaming_history(
+    plugin: "Mnemosyne", session_id: str, last_summary_time: float
+) -> str | None:
+    """
+    [OneBot 漫游消息支持] 分页回溯获取漫游消息
+    逻辑：从最新消息开始，利用 message_id 倒序向前拉取，直到时间戳衔接上 last_summary_time。
+    """
+    try:
+        # 1. 检查配置是否启用
+        roaming_conf = plugin.config.get("onebot_roaming_settings", {})
+        if not roaming_conf.get("enable", True):
+            return None
+        
+        # 2. 解析上下文
+        if plugin.context_manager:
+            session_ctx = plugin.context_manager.get_session_context(session_id)
+            if session_ctx and "event" in session_ctx:
+                event = session_ctx["event"]
+                group_id = event.get_group_id()
+                platform_name = event.get_platform_name()
+                client = getattr(event, "bot", None)
+            else:
+                return None
+        else:
+            return None
+
+        if platform_name != "aiocqhttp" or not group_id or not client:
+            return None
+
+        # 3. 初始化分页参数
+        # 从配置读取参数
+        BATCH_SIZE = roaming_conf.get("batch_size", 50)
+        MAX_TOTAL_MSG = roaming_conf.get("max_history_limit", 500)
+        FIRST_RUN_LIMIT = roaming_conf.get("first_run_limit", 50)
+        
+        # 首次运行保护：如果从未总结过(time=0)，使用较小的限制
+        IS_FIRST_RUN = (last_summary_time == 0)
+        if IS_FIRST_RUN:
+            MAX_TOTAL_MSG = FIRST_RUN_LIMIT
+            logger.info(f"🔧 [OneBot Roaming] 首次运行模式，限制回溯 {MAX_TOTAL_MSG} 条。")
+        
+        all_raw_msgs = []
+        cursor_msg_id = 0 # 0 表示从最新消息开始
+        
+        # 安全断路器 (估算最大轮数)
+        max_rounds = (MAX_TOTAL_MSG // BATCH_SIZE) + 2
+        current_round = 0
+        
+        logger.info(f"🔧 [OneBot Roaming] 开始回溯漫游消息 (Group: {group_id}, Last Summary: {datetime.fromtimestamp(last_summary_time)}, Max: {MAX_TOTAL_MSG})")
+
+        while current_round < max_rounds:
+            current_round += 1
+            
+            # 调用 API
+            if hasattr(client, "api") and hasattr(client.api, "call_action"):
+                # 注意：不同 OneBot 实现对 get_group_msg_history 参数支持不同
+                # NapCat/Lagrange: group_id, message_id (起始ID), count
+                # message_id=0 通常意味着获取最新的
+                try:
+                    params = {"group_id": int(group_id), "count": BATCH_SIZE}
+                    if cursor_msg_id != 0:
+                        # 获取 cursor 之前的消息
+                        params["message_id"] = int(cursor_msg_id)
+                    
+                    resp_data = await client.api.call_action("get_group_msg_history", **params)
+                except Exception as e:
+                    logger.warning(f"API 调用失败 (Round {current_round}): {e}")
+                    break
+                
+                if not resp_data or "messages" not in resp_data:
+                    break
+                
+                batch_msgs = resp_data["messages"]
+                if not batch_msgs:
+                    break
+                    
+                # OneBot 返回的消息列表通常是 [旧 -> 新] 的顺序
+                # 我们需要找到这批消息里最老的一条，作为下一轮的 cursor
+                
+                # 预处理：按时间倒序排列方便检查
+                batch_msgs.sort(key=lambda x: x.get("time", 0), reverse=True)
+                
+                # 检查时间戳覆盖情况
+                batch_min_time = batch_msgs[-1].get("time", 0)
+                batch_max_time = batch_msgs[0].get("time", 0)
+                
+                logger.debug(f"  Batch {current_round}: 获取 {len(batch_msgs)} 条 (Time: {datetime.fromtimestamp(batch_min_time)} - {datetime.fromtimestamp(batch_max_time)})")
+                
+                # 收集消息
+                all_raw_msgs.extend(batch_msgs)
+                
+                # 更新 cursor: 取这批消息里最小的 message_id
+                # 注意：要找 message_id 最小的（通常也是最旧的）
+                # 这里我们假设 batch_msgs[-1] 是最旧的
+                cursor_msg_id = batch_msgs[-1].get("message_id")
+                
+                # 检查是否已经覆盖到了 last_summary_time
+                if batch_min_time <= last_summary_time:
+                    logger.debug("  -> 已回溯到上次总结的时间点，停止拉取。")
+                    break
+                
+                if len(all_raw_msgs) >= MAX_TOTAL_MSG:
+                    logger.info("  -> 达到最大消息数量限制，停止拉取。")
+                    break
+            else:
+                break
+        
+        # 4. 数据清洗与过滤
+        # 去重 (以防 API 返回重叠数据)
+        unique_msgs = {msg.get("message_id"): msg for msg in all_raw_msgs}.values()
+        sorted_msgs = sorted(unique_msgs, key=lambda x: x.get("time", 0))
+        
+        filtered_history = []
+        self_id = str(client.self_id) if hasattr(client, "self_id") else ""
+        
+        for msg in sorted_msgs:
+            msg_time = msg.get("time", 0)
+            
+            # [关键过滤] 再次精确过滤，只保留晚于上次总结时间的消息
+            if msg_time <= last_summary_time:
+                continue
+                
+            sender = msg.get("sender", {})
+            sender_user_id = str(sender.get("user_id", ""))
+            
+            role = "user"
+            if sender_user_id == self_id:
+                role = "assistant"
+            
+            name = sender.get("card") or sender.get("nickname") or sender_user_id
+            
+            # 提取内容
+            content = msg.get("raw_message", "")
+            if not content and "message" in msg:
+                msg_chain = msg.get("message", [])
+                if isinstance(msg_chain, list):
+                    content = "".join([str(seg.get("data", {}).get("text", "")) for seg in msg_chain if seg.get("type") == "text"])
+                elif isinstance(msg_chain, str):
+                    content = msg_chain
+            if not content: content = "[非文本消息]"
+            
+            timestamp = datetime.fromtimestamp(msg_time).strftime("%Y-%m-%d %H:%M:%S")
+            
+            filtered_history.append({
+                "role": role,
+                "content": content,
+                "name": name,
+                "timestamp": timestamp
+            })
+        
+        if filtered_history:
+            logger.info(f"🔧 [OneBot Roaming] 最终有效新消息: {len(filtered_history)} 条 (从 {len(all_raw_msgs)} 条原始数据中筛选)")
+            return format_context_to_string(filtered_history, len(filtered_history))
+        else:
+            return None
+            
+    except Exception as e:
+        logger.warning(f"🔧 [OneBot Roaming] 获取漫游消息失败: {e}")
+        return None
+    return None
+
+
 async def _check_and_trigger_summary(
     plugin: "Mnemosyne",
     session_id: str,
@@ -286,16 +448,8 @@ async def _check_and_trigger_summary(
 ):
     """
     检查是否满足总结条件并触发总结任务。
-
-    Args:
-        plugin: Mnemosyne 插件实例。
-        session_id: 会话 ID。
-        context: 请求上下文列表。
-        persona_id: 人格 ID.
     """
     # M24 修复: 添加 msg_counter 的类型检查
-    # num_pairs 是对话轮数，msg_counter 计数的是消息条数（一问一答=2条消息）
-    # 所以需要用 num_pairs * 2 来比较
     num_pairs = plugin.config.get("num_pairs", 5)
     if (
         plugin.msg_counter
@@ -303,16 +457,31 @@ async def _check_and_trigger_summary(
         and plugin.msg_counter.get_counter(session_id) >= num_pairs * 2
     ):
         logger.info(f"对话已达到 {num_pairs} 轮，开始总结历史对话...")
-        # M24 修复: 添加类型忽略，context 来自运行时的上下文
-        history_contents = format_context_to_string(
-            context,  # type: ignore
-            num_pairs * 2,  # 传递消息条数而不是轮数
-        )
+        
+        # [Priority] 优先尝试获取 OneBot 漫游消息
+        last_summary_time = 0
+        if plugin.context_manager:
+            last_summary_time = plugin.context_manager.get_summary_time(session_id)
+            
+        history_contents = await _try_fetch_roaming_history(plugin, session_id, last_summary_time)
+        
+        # [Fallback] 如果漫游消息获取失败，使用内存历史
+        if not history_contents:
+            history_contents = format_context_to_string(
+                context,  # type: ignore
+                num_pairs * 2,  # 传递消息条数而不是轮数
+            )
+        else:
+             logger.info(f"✅ 使用 OneBot 漫游消息作为总结源数据。")
 
         # M19 修复: 为后台任务添加异常处理回调
         task = asyncio.create_task(
             handle_summary_long_memory(plugin, persona_id, session_id, history_contents)
         )
+        
+        # 更新总结时间
+        if plugin.context_manager:
+            plugin.context_manager.update_summary_time(session_id)
 
         # [Visual Log] 显式日志：对话轮数触发总结
         logger.info("="*40)
@@ -979,16 +1148,25 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                         
                         # 运行总结
                         logger.info("开始总结历史对话...")
-                        # M24 修复: 添加 msg_counter 的类型检查和类型忽略
-                        counter = (
-                            plugin.msg_counter.get_counter(session_id)
-                            if plugin.msg_counter
-                            else 0
-                        )
-                        history_contents = format_context_to_string(
-                            session_context["history"],
-                            counter,  # type: ignore
-                        )
+                        
+                        # [Priority] 优先尝试获取 OneBot 漫游消息
+                        history_contents = await _try_fetch_roaming_history(plugin, session_id, last_summary_time)
+                        
+                        # [Fallback] 如果漫游消息获取失败，使用内存历史
+                        if not history_contents:
+                            # M24 修复: 添加 msg_counter 的类型检查和类型忽略
+                            counter = (
+                                plugin.msg_counter.get_counter(session_id)
+                                if plugin.msg_counter
+                                else 0
+                            )
+                            history_contents = format_context_to_string(
+                                session_context["history"],
+                                counter,  # type: ignore
+                            )
+                        else:
+                            logger.info(f"✅ 使用 OneBot 漫游消息作为总结源数据 (定时任务)。")
+
                         persona_id = await _get_persona_id(
                             plugin, session_context["event"]
                         )
