@@ -875,6 +875,11 @@ async def handle_summary_long_memory(
             if not summary_text:
                 return
 
+            # [Visual Log] 打印 LLM 生成的总结内容 (Debug 可见)
+            logger.info("="*20 + " [Mnemosyne] Generated Summary " + "="*20)
+            logger.info(f"{summary_text}")
+            logger.info("="*60)
+
             # 3. 获取总结文本的 Embedding
             # 使用 AstrBot EmbeddingProvider（异步）
             try:
