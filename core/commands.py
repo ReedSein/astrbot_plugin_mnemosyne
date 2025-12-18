@@ -739,10 +739,31 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
         yield event.plain_result("⚠️ Context Manager 未初始化。")
         return
     
-    # 获取所有历史
+    # 尝试从内存获取历史
     history_list = self.context_manager.get_history(session_id)
+    
+    # 如果内存为空（例如插件刚启动），尝试从 AstrBot 核心数据库拉取
     if not history_list:
-        yield event.plain_result("⚠️ 当前会话历史为空，无法总结。")
+        logger.info(f"🔧 [Debug] 内存历史为空，尝试从 AstrBot 核心拉取...")
+        try:
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(session_id)
+            if curr_cid:
+                conversation = await conv_mgr.get_conversation(session_id, curr_cid)
+                if conversation and conversation.history:
+                    # AstrBot 存储的 history 是 JSON 字符串或 list of dicts
+                    import json
+                    if isinstance(conversation.history, str):
+                        history_list = json.loads(conversation.history)
+                    elif isinstance(conversation.history, list):
+                        history_list = conversation.history
+                    
+                    logger.info(f"🔧 [Debug] 成功从核心数据库拉取到 {len(history_list)} 条记录。")
+        except Exception as e:
+            logger.error(f"从核心拉取历史失败: {e}")
+
+    if not history_list:
+        yield event.plain_result("⚠️ 无法获取到任何历史记录（内存与核心数据库均为空）。请先与机器人进行几轮对话后再试。")
         return
         
     yield event.plain_result(f"🔍 正在读取最近 {len(history_list)} 条历史记录...")
