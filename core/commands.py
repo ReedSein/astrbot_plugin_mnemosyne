@@ -743,91 +743,25 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
     history_list = self.context_manager.get_history(session_id)
     
     # [OneBot 漫游消息支持] 尝试直接从适配器获取漫游消息
-    onebot_history_fetched = False
+    from .memory_operations import _try_fetch_roaming_history, _get_persona_id, handle_summary_long_memory
     
-    # 读取配置
-    roaming_conf = self.config.get("onebot_roaming_settings", {})
-    enable_roaming = roaming_conf.get("enable", True)
-    fetch_count = roaming_conf.get("fetch_count", 100)
+    # 获取上次总结时间，模拟真实的增量获取
+    last_summary_time = 0
+    if self.context_manager:
+        last_summary_time = self.context_manager.get_summary_time(session_id)
+
+    # 尝试使用核心逻辑获取漫游消息
+    # 注意：这里我们传入 last_summary_time，以便测试增量获取逻辑
+    # 如果想测试全量，可以临时修改 last_summary_time 为 0，但为了模拟真实情况，保持原样
+    roaming_content = await _try_fetch_roaming_history(self, session_id, last_summary_time)
     
-    try:
-        # 仅针对 aiocqhttp 平台的群聊，且配置启用
-        if enable_roaming and event.get_platform_name() == "aiocqhttp" and event.get_group_id():
-            group_id = event.get_group_id()
-            logger.info(f"🔧 [Debug] 检测到 OneBot 群聊环境 (Group: {group_id})，尝试拉取漫游消息 (Limit: {fetch_count})...")
-            
-            # 获取 Bot 实例 (通常是 event.bot)
-            # 或者是 platform.get_client()
-            client = getattr(event, "bot", None)
-            
-            if client and hasattr(client, "api") and hasattr(client.api, "call_action"):
-                # 调用 get_group_msg_history 接口
-                try:
-                    # 获取配置数量的消息
-                    resp_data = await client.api.call_action("get_group_msg_history", group_id=int(group_id), count=fetch_count)
-                    
-                    if resp_data and "messages" in resp_data:
-                        raw_msgs = resp_data["messages"]
-                        # 转换格式为 Mnemosyne 可读的 dict
-                        # OneBot Msg -> {"role": "user", "content": "...", "name": "...", "timestamp": ...}
-                        converted_history = []
-                        
-                        # 获取当前 Bot 的 QQ 号，用于区分自我发言
-                        self_id = str(client.self_id) if hasattr(client, "self_id") else ""
-                        
-                        for msg in raw_msgs:
-                            sender = msg.get("sender", {})
-                            sender_user_id = str(sender.get("user_id", ""))
-                            
-                            role = "user"
-                            if sender_user_id == self_id:
-                                role = "assistant"
-                            
-                            # 优先取群名片(card)，其次取昵称(nickname)，最后取ID
-                            name = sender.get("card") or sender.get("nickname") or sender_user_id
-                            
-                            # 处理消息内容
-                            content = msg.get("raw_message", "")
-                            if not content and "message" in msg:
-                                # 尝试从 message 链中提取文本
-                                msg_chain = msg.get("message", [])
-                                if isinstance(msg_chain, list):
-                                    content = "".join([str(seg.get("data", {}).get("text", "")) for seg in msg_chain if seg.get("type") == "text"])
-                                elif isinstance(msg_chain, str):
-                                    content = msg_chain
-                            
-                            if not content:
-                                content = "[非文本消息]"
-
-                            timestamp = datetime.fromtimestamp(msg.get("time", 0)).strftime("%Y-%m-%d %H:%M:%S")
-                            
-                            converted_history.append({
-                                "role": role,
-                                "content": content,
-                                "name": name,
-                                "timestamp": timestamp
-                            })
-                        
-                        if converted_history:
-                            history_list = converted_history # 覆盖内存历史
-                            onebot_history_fetched = True
-                            logger.info(f"🔧 [Debug] 成功从 OneBot 拉取到 {len(history_list)} 条漫游消息。")
-                    else:
-                        logger.warning(f"OneBot API 返回数据不包含 messages: {resp_data}")
-                except Exception as api_e:
-                     logger.warning(f"调用 get_group_msg_history 失败: {api_e} (可能不支持此 API)")
-            else:
-                logger.warning("无法获取 OneBot Client 或 API 接口")
-    except Exception as e:
-        logger.warning(f"尝试拉取 OneBot 漫游消息失败 (将回退到核心历史): {e}")
-
-    # 如果内存为空且没拉到 OneBot 消息（例如插件刚启动），尝试从 AstrBot 核心数据库拉取
-    if not history_list and not onebot_history_fetched:
-        logger.info(f"🔧 [Debug] 内存历史为空，尝试从 AstrBot 核心拉取...")
-
-    # 如果内存为空且没拉到 OneBot 消息（例如插件刚启动），尝试从 AstrBot 核心数据库拉取
-    if not history_list and not onebot_history_fetched:
-        logger.info(f"🔧 [Debug] 内存历史为空，尝试从 AstrBot 核心拉取...")
+    if roaming_content:
+        history_str = roaming_content
+        logger.info(f"🔧 [Debug] 成功通过核心逻辑 (_try_fetch_roaming_history) 拉取到漫游消息。")
+    else:
+        logger.info(f"🔧 [Debug] 核心逻辑未返回漫游消息，尝试从 AstrBot 核心数据库拉取...")
+        
+        # 尝试从 AstrBot 核心数据库拉取
         try:
             conv_mgr = self.context.conversation_manager
             curr_cid = await conv_mgr.get_curr_conversation_id(session_id)
@@ -845,23 +779,22 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
         except Exception as e:
             logger.error(f"从核心拉取历史失败: {e}")
 
-    if not history_list:
-        yield event.plain_result("⚠️ 无法获取到任何历史记录（内存与核心数据库均为空）。请先与机器人进行几轮对话后再试。")
-        return
-        
-    yield event.plain_result(f"🔍 正在读取最近 {len(history_list)} 条历史记录...")
+        if not history_list:
+            yield event.plain_result("⚠️ 无法获取到任何历史记录（漫游失败且核心数据库为空）。请先与机器人进行几轮对话后再试。")
+            return
+            
+        yield event.plain_result(f"🔍 正在读取最近 {len(history_list)} 条历史记录 (AstrBot Core DB)...")
 
-    # 2. 格式化历史 (Input)
-    from .tools import format_context_to_string
-    # 传递足够大的轮数以包含所有历史
-    history_str = format_context_to_string(history_list, len(history_list) * 2)
+        # 2. 格式化历史 (Input)
+        from .tools import format_context_to_string
+        # 传递足够大的轮数以包含所有历史
+        history_str = format_context_to_string(history_list, len(history_list) * 2)
     
     logger.info("="*20 + " [Debug] History Input " + "="*20)
     logger.info(history_str)
     logger.info("="*60)
 
     # 3. 获取 Persona ID
-    from .memory_operations import _get_persona_id, handle_summary_long_memory
     persona_id = await _get_persona_id(self, event)
 
     yield event.plain_result("⏳ 正在执行总结流水线 (生成 -> 向量化 -> 存储)...")
