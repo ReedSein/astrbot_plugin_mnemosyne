@@ -510,8 +510,7 @@ async def _check_and_trigger_summary(
         # [Visual Log] 显式日志：对话轮数触发总结
         logger.info("="*40)
         logger.info(f"⏰ [Mnemosyne] 触发记忆总结 (机制: 对话轮数)")
-        logger.info(f"📊 当前计数: {plugin.msg_counter.get_counter(session_id)}")
-        logger.info(f"🎯 触发阈值: {num_pairs * 2} (即 {num_pairs} 轮)")
+        logger.info(f"📊 进度对比: {plugin.msg_counter.get_counter(session_id)} / {num_pairs * 2} (消息数)")
         logger.info(f"🆔 Session: {session_id}")
         logger.info("="*40)
 
@@ -609,9 +608,15 @@ async def _perform_milvus_search(
     top_k = plugin.config.get("top_k", DEFAULT_TOP_K)
     timeout_seconds = plugin.config.get("milvus_search_timeout", DEFAULT_MILVUS_TIMEOUT)
 
-    logger.info(
-        f"开始在集合 '{collection_name}' 中搜索相关记忆 (TopK: {top_k}, Filter: '{search_expression or '无'}')"
-    )
+    # [Debug Trace] RAG Search Parameters
+    logger.info("="*40)
+    logger.info(f"🔍 [Mnemosyne] 启动向量检索")
+    logger.info(f"📂 集合: {collection_name}")
+    logger.info(f"🆔 Session: {session_id}")
+    logger.info(f"🎭 Persona: {persona_id}")
+    logger.info(f"🔢 TopK: {top_k}")
+    logger.info(f"🧬 过滤表达式: {search_expression or '无'}")
+    logger.info("="*40)
 
     # M24 修复: 添加 milvus_manager 的类型检查
     if not plugin.milvus_manager:
@@ -645,13 +650,15 @@ async def _perform_milvus_search(
         return None
 
     if not search_results or not search_results[0]:
-        logger.info("向量搜索未找到相关记忆。")
+        logger.info(f"⚠️ [Mnemosyne] 向量搜索返回空结果 (Hits: 0)")
         return None
     else:
         # 从 search_results 中获取 Hits 对象
         hits = search_results[0]
         # 调用新的辅助函数来处理 Hits 对象并提取详细结果
         detailed_results = _process_milvus_hits(hits)
+        
+        logger.info(f"✅ [Mnemosyne] 搜索命中: {len(hits)} 条 | 有效提取: {len(detailed_results)} 条")
         return detailed_results
 
 
@@ -1165,8 +1172,7 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                         time_diff = int(current_time - last_summary_time)
                         logger.info("="*40)
                         logger.info(f"⏰ [Mnemosyne] 触发记忆总结 (机制: 定时任务)")
-                        logger.info(f"⌛ 距上次总结: {time_diff} 秒")
-                        logger.info(f"🎯 超时阈值: {plugin.summary_time_threshold} 秒")
+                        logger.info(f"📊 进度对比: {time_diff}s / {plugin.summary_time_threshold}s (时间)")
                         logger.info(f"🆔 Session: {session_id}")
                         logger.info("="*40)
                         
