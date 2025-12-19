@@ -101,7 +101,8 @@ async def handle_query_memory(
         clean_contexts(plugin, req)
 
         # 添加用户消息
-        plugin.context_manager.add_message(session_id, "user", req.prompt)
+        # [Optimization] 移除内存历史记录，仅依赖 msg_counter 计数
+        # plugin.context_manager.add_message(session_id, "user", req.prompt)
         # 计数器+1
         plugin.msg_counter.increment_counter(session_id)
 
@@ -205,9 +206,8 @@ async def handle_on_llm_resp(
         )
 
         logger.debug(f"返回的内容：{resp.completion_text}")
-        plugin.context_manager.add_message(
-            session_id, "assistant", resp.completion_text
-        )
+        # [Optimization] 移除内存历史记录
+        # plugin.context_manager.add_message(session_id, "assistant", resp.completion_text)
         plugin.msg_counter.increment_counter(session_id)
 
     except Exception as e:
@@ -465,14 +465,38 @@ async def _check_and_trigger_summary(
             
         history_contents = await _try_fetch_roaming_history(plugin, session_id, last_summary_time)
         
-        # [Fallback] 如果漫游消息获取失败，使用内存历史
+        # [Fallback] 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
         if not history_contents:
-            history_contents = format_context_to_string(
-                context,  # type: ignore
-                num_pairs * 2,  # 传递消息条数而不是轮数
-            )
+            logger.warning(f"⚠️ OneBot 漫游消息获取失败，尝试从 AstrBot 核心数据库拉取...")
+            try:
+                conv_mgr = plugin.context.conversation_manager
+                curr_cid = await conv_mgr.get_curr_conversation_id(session_id)
+                if curr_cid:
+                    conversation = await conv_mgr.get_conversation(session_id, curr_cid)
+                    if conversation and conversation.history:
+                        import json
+                        history_list = []
+                        if isinstance(conversation.history, str):
+                            history_list = json.loads(conversation.history)
+                        elif isinstance(conversation.history, list):
+                            history_list = conversation.history
+                        
+                        if history_list:
+                            # 仅截取最近的部分，避免过长
+                            history_contents = format_context_to_string(history_list, num_pairs * 2)
+                            logger.info(f"✅ 使用 AstrBot 核心数据库历史作为总结源数据。")
+            except Exception as e:
+                logger.error(f"从 AstrBot 核心数据库拉取历史失败: {e}")
+
+        if not history_contents:
+            logger.error(f"❌ 无法获取任何历史记录（漫游失败且核心数据库为空），跳过本次总结。")
+            # 重置计数器以防止死循环尝试
+            if plugin.msg_counter:
+                plugin.msg_counter.reset_counter(session_id)
+            return
         else:
-             logger.info(f"✅ 使用 OneBot 漫游消息作为总结源数据。")
+             if not history_contents.startswith("✅"): # 避免重复打印日志
+                logger.info(f"✅ 使用 OneBot 漫游消息作为总结源数据。")
 
         # M19 修复: 为后台任务添加异常处理回调
         task = asyncio.create_task(
@@ -1152,18 +1176,38 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                         # [Priority] 优先尝试获取 OneBot 漫游消息
                         history_contents = await _try_fetch_roaming_history(plugin, session_id, last_summary_time)
                         
-                        # [Fallback] 如果漫游消息获取失败，使用内存历史
+                        # [Fallback] 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
                         if not history_contents:
-                            # M24 修复: 添加 msg_counter 的类型检查和类型忽略
-                            counter = (
-                                plugin.msg_counter.get_counter(session_id)
-                                if plugin.msg_counter
-                                else 0
-                            )
-                            history_contents = format_context_to_string(
-                                session_context["history"],
-                                counter,  # type: ignore
-                            )
+                            logger.warning(f"⚠️ OneBot 漫游消息获取失败 (定时任务)，尝试从 AstrBot 核心数据库拉取...")
+                            try:
+                                conv_mgr = plugin.context.conversation_manager
+                                curr_cid = await conv_mgr.get_curr_conversation_id(session_id)
+                                if curr_cid:
+                                    conversation = await conv_mgr.get_conversation(session_id, curr_cid)
+                                    if conversation and conversation.history:
+                                        import json
+                                        history_list = []
+                                        if isinstance(conversation.history, str):
+                                            history_list = json.loads(conversation.history)
+                                        elif isinstance(conversation.history, list):
+                                            history_list = conversation.history
+                                        
+                                        if history_list:
+                                            # 获取计数器数值作为参考长度
+                                            counter = 0
+                                            if plugin.msg_counter:
+                                                counter = plugin.msg_counter.get_counter(session_id)
+                                            # 如果计数器为0，默认取最近20条
+                                            fetch_len = counter if counter > 0 else 20
+
+                                            history_contents = format_context_to_string(history_list, fetch_len)
+                                            logger.info(f"✅ 使用 AstrBot 核心数据库历史作为总结源数据 (定时任务)。")
+                            except Exception as e:
+                                logger.error(f"从 AstrBot 核心数据库拉取历史失败: {e}")
+
+                        if not history_contents:
+                             logger.error(f"❌ 无法获取任何历史记录（漫游失败且核心数据库为空），跳过本次总结 (定时任务)。")
+                             continue
                         else:
                             logger.info(f"✅ 使用 OneBot 漫游消息作为总结源数据 (定时任务)。")
 
