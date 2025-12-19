@@ -790,9 +790,14 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
         # 传递足够大的轮数以包含所有历史
         history_str = format_context_to_string(history_list, len(history_list) * 2)
     
-    logger.info("="*20 + " [Debug] History Input " + "="*20)
-    logger.info(history_str)
-    logger.info("="*60)
+    # [Optimization] 停止打印冗长的原始内容，改为仅显示统计信息
+    msg_count = history_str.count('\n') + 1 if history_str else 0
+    
+    logger.info("="*40)
+    logger.info(f"⏰ [Mnemosyne] 触发记忆总结 (机制: 手动调试)")
+    logger.info(f"📊 提取消息总数: {msg_count}")
+    logger.info(f"🆔 Session: {session_id}")
+    logger.info("="*40)
 
     # 3. 获取 Persona ID
     persona_id = await _get_persona_id(self, event)
@@ -803,9 +808,19 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
         # 直接调用核心业务函数，复用其内部的所有逻辑（包括 embedding 和 milvus insert）
         # 注意：这是一个后台任务函数，这里我们需要 await 它
         await handle_summary_long_memory(self, persona_id, session_id, history_str)
+
+        # [Reset] 手动总结成功后，同步重置计数器和定时器，防止冗余的自动总结
+        if self.msg_counter:
+            self.msg_counter.reset_counter(session_id)
+            logger.info(f"🔧 [Debug] 已重置会话 {session_id} 的消息计数器。")
+        
+        if self.context_manager:
+            self.context_manager.update_summary_time(session_id)
+            logger.info(f"🔧 [Debug] 已更新会话 {session_id} 的最后总结时间。")
         
         yield event.plain_result(
             "✅ 总结流程执行完毕！\n"
+            "已同步重置计数器和定时器。\n"
             "请检查控制台日志确认 LLM 输出内容。\n"
             "验证方法：请执行 `/memory list_records` 查看最新的一条记录是否为刚才生成的总结。"
         )
