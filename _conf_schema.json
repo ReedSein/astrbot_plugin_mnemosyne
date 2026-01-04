@@ -141,16 +141,16 @@
         "default": "user_prompt"
     },
     "onebot_roaming_settings": {
-        "description": "OneBot 漫游消息设置（计数与总结的唯一事实源，适用于 NapCat/Lagrange 群聊）",
+        "description": "OneBot 漫游消息设置（仅用于获取总结内容，不再校正计数，适用于 NapCat/Lagrange 群聊）",
         "type": "object",
-        "hint": "开启后，计数器校正与总结内容都直接取 OneBot 群聊漫游消息；仅 aiocqhttp 群聊可用，失败时回退 AstrBot 核心历史。",
+        "hint": "开启后，自动总结时优先使用 OneBot 群聊漫游内容；仅 aiocqhttp 群聊可用，失败时回退 AstrBot 核心历史。计数器改为仅用持久化计数，不依赖漫游条数。",
         "obvious_hint": true,
         "items": {
             "enable": {
                 "description": "启用漫游消息拉取（推荐开启）",
                 "type": "bool",
                 "default": true,
-                "hint": "true: 计数与总结都用 OneBot 群聊漫游；false: 直接跳过漫游，计数与总结回退 AstrBot 核心历史（较不精确）。"
+                "hint": "true: 总结内容用 OneBot 群聊漫游；false: 跳过漫游，直接回退 AstrBot 核心历史。计数器不受此开关影响。"
             },
             "max_history_limit": {
                 "description": "最大回溯消息总数（单次总结）",
