@@ -141,40 +141,40 @@
         "default": "user_prompt"
     },
     "onebot_roaming_settings": {
-        "description": "OneBot 漫游消息设置",
+        "description": "OneBot 漫游消息设置（计数与总结的唯一事实源，适用于 NapCat/Lagrange 群聊）",
         "type": "object",
-        "hint": "配置从 OneBot 适配器直接拉取漫游消息的行为（支持分批回溯获取完整上下文）",
+        "hint": "开启后，计数器校正与总结内容都直接取 OneBot 群聊漫游消息；仅 aiocqhttp 群聊可用，失败时回退 AstrBot 核心历史。",
         "obvious_hint": true,
         "items": {
             "enable": {
-                "description": "启用漫游消息拉取",
+                "description": "启用漫游消息拉取（推荐开启）",
                 "type": "bool",
                 "default": true,
-                "hint": "是否尝试从 OneBot API 获取群聊漫游消息。开启后可获得精确的发送者昵称和时间戳，且支持拉取 AstrBot 离线期间的消息。"
+                "hint": "true: 计数与总结都用 OneBot 群聊漫游；false: 直接跳过漫游，计数与总结回退 AstrBot 核心历史（较不精确）。"
             },
             "max_history_limit": {
-                "description": "最大回溯消息总数",
+                "description": "最大回溯消息总数（单次总结）",
                 "type": "int",
                 "default": 500,
                 "minimum": 50,
                 "maximum": 2000,
-                "hint": "单次总结时，最多向前回溯多少条历史消息。即使未总结的消息超过此数，也会强制截断，防止 Token 消耗过大。"
+                "hint": "单次总结的拉取上限，超过即截断；过大增加 token 负担，建议结合模型上下文设置（如 300-800）。"
             },
             "batch_size": {
-                "description": "单次 API 请求条数",
+                "description": "单次 API 请求条数（OneBot 调用）",
                 "type": "int",
                 "default": 50,
                 "minimum": 20,
                 "maximum": 100,
-                "hint": "每次向 OneBot 接口请求的消息数量。建议保持默认 50，过大可能导致 API 超时。"
+                "hint": "OneBot `get_group_msg_history` 的 count；过大可能超时，过小会多次请求，默认 50。"
             },
             "first_run_limit": {
-                "description": "首次运行拉取限制",
+                "description": "首次运行拉取限制（last_summary_time=0 时）",
                 "type": "int",
                 "default": 50,
                 "minimum": 10,
                 "maximum": 200,
-                "hint": "当插件首次运行（或无上次总结记录）时，限制拉取的消息数量。防止初次启动时拉取数千条历史导致卡顿。"
+                "hint": "防止首次启动/无总结记录时拉取过多历史导致卡顿；达到该值即停止回溯。"
             }
         }
     },
