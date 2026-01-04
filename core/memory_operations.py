@@ -198,12 +198,7 @@ async def handle_on_llm_resp(
         persona_id = await _get_persona_id(plugin, event)
 
         # 判断是否需要总结
-        await _check_and_trigger_summary(
-            plugin,
-            session_id,
-            plugin.context_manager.get_history(session_id),
-            persona_id,
-        )
+        await _check_and_trigger_summary(plugin, event, session_id, persona_id)
 
         logger.debug(f"返回的内容：{resp.completion_text}")
         # [Optimization] 移除内存历史记录
@@ -280,7 +275,7 @@ async def _get_persona_id(plugin: "Mnemosyne", event: AstrMessageEvent) -> str |
 
 async def _try_fetch_roaming_history(
     plugin: "Mnemosyne", session_id: str, last_summary_time: float
-) -> str | None:
+) -> tuple[str | None, int | None]:
     """
     [OneBot 漫游消息支持] 分页回溯获取漫游消息
     逻辑：从最新消息开始，利用 message_id 倒序向前拉取，直到时间戳衔接上 last_summary_time。
@@ -289,7 +284,7 @@ async def _try_fetch_roaming_history(
         # 1. 检查配置是否启用
         roaming_conf = plugin.config.get("onebot_roaming_settings", {})
         if not roaming_conf.get("enable", True):
-            return None
+            return None, None
         
         # 2. 解析上下文
         if plugin.context_manager:
@@ -300,12 +295,12 @@ async def _try_fetch_roaming_history(
                 platform_name = event.get_platform_name()
                 client = getattr(event, "bot", None)
             else:
-                return None
+                return None, None
         else:
-            return None
+            return None, None
 
         if platform_name != "aiocqhttp" or not group_id or not client:
-            return None
+            return None, None
 
         # 3. 初始化分页参数
         # 从配置读取参数
@@ -429,21 +424,26 @@ async def _try_fetch_roaming_history(
             })
         
         if filtered_history:
-            logger.info(f"🔧 [OneBot Roaming] 最终有效新消息: {len(filtered_history)} 条 (从 {len(all_raw_msgs)} 条原始数据中筛选)")
-            return format_context_to_string(filtered_history, len(filtered_history))
+            logger.info(
+                f"🔧 [OneBot Roaming] 最终有效新消息: {len(filtered_history)} 条 (从 {len(all_raw_msgs)} 条原始数据中筛选)"
+            )
+            return (
+                format_context_to_string(filtered_history, len(filtered_history)),
+                len(filtered_history),
+            )
         else:
-            return None
+            return None, 0
             
     except Exception as e:
         logger.warning(f"🔧 [OneBot Roaming] 获取漫游消息失败: {e}")
-        return None
-    return None
+        return None, None
+    return None, None
 
 
 async def _check_and_trigger_summary(
     plugin: "Mnemosyne",
+    event: AstrMessageEvent,
     session_id: str,
-    context: list[dict],
     persona_id: str | None,
 ):
     """
@@ -451,21 +451,26 @@ async def _check_and_trigger_summary(
     """
     # M24 修复: 添加 msg_counter 的类型检查
     num_pairs = plugin.config.get("num_pairs", 5)
+    last_summary_time = 0
+    if plugin.context_manager:
+        last_summary_time = plugin.context_manager.get_summary_time(session_id)
+
+    history_contents = None
+    history_length = None
+    history_contents, history_length = await _try_fetch_roaming_history(
+        plugin, session_id, last_summary_time
+    )
     if (
         plugin.msg_counter
-        and plugin.msg_counter.adjust_counter_if_necessary(session_id, context)
+        and plugin.msg_counter.adjust_counter_if_necessary(
+            session_id, history_length
+        )
         and plugin.msg_counter.get_counter(session_id) >= num_pairs * 2
     ):
         logger.info(f"对话已达到 {num_pairs} 轮，开始总结历史对话...")
         
         # [Priority] 优先尝试获取 OneBot 漫游消息
-        last_summary_time = 0
-        if plugin.context_manager:
-            last_summary_time = plugin.context_manager.get_summary_time(session_id)
-            
-        history_contents = await _try_fetch_roaming_history(plugin, session_id, last_summary_time)
-        
-        # [Fallback] 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
+        # 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
         if not history_contents:
             logger.warning(f"⚠️ OneBot 漫游消息获取失败，尝试从 AstrBot 核心数据库拉取...")
             try:
@@ -1180,7 +1185,9 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                         logger.info("开始总结历史对话...")
                         
                         # [Priority] 优先尝试获取 OneBot 漫游消息
-                        history_contents = await _try_fetch_roaming_history(plugin, session_id, last_summary_time)
+                        history_contents, _ = await _try_fetch_roaming_history(
+                            plugin, session_id, last_summary_time
+                        )
                         
                         # [Fallback] 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
                         if not history_contents:
