@@ -260,31 +260,35 @@ class MessageCounter:
                 return 0  # 发生错误时返回 0
 
     def adjust_counter_if_necessary(
-        self, session_id: str, context_history: list
+        self, session_id: str, history_length: int | None
     ) -> bool:
         """
-        检查上下文历史对话轮次长度是否小于消息计数器，如果小于则调整计数器。
+        检查历史长度是否小于消息计数器，如果小于则调整计数器。
 
         Args:
             session_id (str): 会话 ID。
-            context_history (list): 大模型的上下文历史对话列表。
-                                    假设 context_history 是一个消息列表，
-                                    每条消息代表用户或 AI 的一次发言。
-                                    轮次长度可以简单地理解为消息列表的长度。
+            history_length (int | None): 可靠来源的历史消息长度。为 None 或 <=0 时跳过校正。
 
         Returns:
-            bool: True 表示计数器正常或已调整，False 表示调整失败
+            bool: True 表示计数器正常或无需校正，False 表示发生了校正或校正失败
         """
         if not session_id:
             logging.warning("尝试调整空 session_id 的计数器，已忽略")
             return False
 
+        if history_length is None or not isinstance(history_length, int):
+            logging.debug("未提供可靠历史长度，跳过计数器校正")
+            return True
+
+        if history_length <= 0:
+            logging.debug("历史长度无效，跳过计数器校正")
+            return True
+
         current_counter = self.get_counter(session_id)
-        history_length = len(context_history)
 
         if history_length < current_counter:
             logging.warning(
-                f"意外情况: 会话 {session_id} 的上下文历史长度 ({history_length}) 小于消息计数器 ({current_counter})，可能存在数据不一致。"
+                f"意外情况: 会话 {session_id} 的历史长度 ({history_length}) 小于消息计数器 ({current_counter})，可能存在数据不一致。"
             )
             with self._lock:
                 try:
@@ -296,18 +300,18 @@ class MessageCounter:
                     )
                     conn.commit()
                     logging.warning(
-                        f"计数器已调整为上下文历史长度 ({history_length})。"
+                        f"计数器已调整为历史长度 ({history_length})。"
                     )
                     return False
                 except sqlite3.Error as e:
                     logging.error(f"调整会话 {session_id} 计数器时发生数据库错误: {e}")
                     conn.rollback()
-                    return False  # 调整失败也返回 False，表示可能需要进一步处理
-        else:
-            logging.debug(
-                f"会话 {session_id} 的上下文历史长度 ({history_length}) 与消息计数器 ({current_counter}) 一致。"
-            )
-            return True
+                    return False
+
+        logging.debug(
+            f"会话 {session_id} 的历史长度 ({history_length}) 与消息计数器 ({current_counter}) 一致。"
+        )
+        return True
 
     def close(self):
         """
