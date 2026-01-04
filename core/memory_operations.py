@@ -387,12 +387,21 @@ async def _try_fetch_roaming_history(
         
         filtered_history = []
         self_id = str(client.self_id) if hasattr(client, "self_id") else ""
+
+        def _is_relevant_message(msg: dict, bot_id: str) -> bool:
+            """仅统计机器人自己发送的消息，忽略仅@机器人但机器人沉默的情况。"""
+            sender = msg.get("sender", {})
+            sender_user_id = str(sender.get("user_id", ""))
+            return bool(bot_id and sender_user_id == bot_id)
         
         for msg in sorted_msgs:
             msg_time = msg.get("time", 0)
             
             # [关键过滤] 再次精确过滤，只保留晚于上次总结时间的消息
             if msg_time <= last_summary_time:
+                continue
+
+            if not _is_relevant_message(msg, self_id):
                 continue
                 
             sender = msg.get("sender", {})
@@ -425,7 +434,7 @@ async def _try_fetch_roaming_history(
         
         if filtered_history:
             logger.info(
-                f"🔧 [OneBot Roaming] 最终有效新消息: {len(filtered_history)} 条 (从 {len(all_raw_msgs)} 条原始数据中筛选)"
+                f"🔧 [OneBot Roaming] 最终有效新消息: {len(filtered_history)} 条 (相关/全部={len(filtered_history)}/{len(all_raw_msgs)})"
             )
             return (
                 format_context_to_string(filtered_history, len(filtered_history)),
@@ -456,15 +465,21 @@ async def _check_and_trigger_summary(
         last_summary_time = plugin.context_manager.get_summary_time(session_id)
 
     history_contents = None
-    history_length = None
-    history_contents, history_length = await _try_fetch_roaming_history(
+    history_contents, _ = await _try_fetch_roaming_history(
         plugin, session_id, last_summary_time
     )
+    # 如果重启后（last_summary_time=0）计数器已超过阈值，直接重置，避免启动即触发总结
+    if last_summary_time == 0 and plugin.msg_counter:
+        threshold = num_pairs * 2
+        if plugin.msg_counter.get_counter(session_id) >= threshold:
+            logger.info(
+                f"⚖️ 检测到重启后计数器 {plugin.msg_counter.get_counter(session_id)} 已超过阈值 {threshold}，重置计数器。"
+            )
+            plugin.msg_counter.reset_counter(session_id)
+            return
+
     if (
         plugin.msg_counter
-        and plugin.msg_counter.adjust_counter_if_necessary(
-            session_id, history_length
-        )
         and plugin.msg_counter.get_counter(session_id) >= num_pairs * 2
     ):
         logger.info(f"对话已达到 {num_pairs} 轮，开始总结历史对话...")
