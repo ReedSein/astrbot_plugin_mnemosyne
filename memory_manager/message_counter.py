@@ -263,54 +263,9 @@ class MessageCounter:
         self, session_id: str, history_length: int | None
     ) -> bool:
         """
-        检查历史长度是否小于消息计数器，如果小于则调整计数器。
-
-        Args:
-            session_id (str): 会话 ID。
-            history_length (int | None): 可靠来源的历史消息长度。为 None 或 <=0 时跳过校正。
-
-        Returns:
-            bool: True 表示计数器正常或无需校正，False 表示发生了校正或校正失败
+        已废弃：不再自动校正计数器，保持持久化计数为唯一来源。
         """
-        if not session_id:
-            logging.warning("尝试调整空 session_id 的计数器，已忽略")
-            return False
-
-        if history_length is None or not isinstance(history_length, int):
-            logging.debug("未提供可靠历史长度，跳过计数器校正")
-            return True
-
-        if history_length <= 0:
-            logging.debug("历史长度无效，跳过计数器校正")
-            return True
-
-        current_counter = self.get_counter(session_id)
-
-        if history_length < current_counter:
-            logging.warning(
-                f"意外情况: 会话 {session_id} 的历史长度 ({history_length}) 小于消息计数器 ({current_counter})，可能存在数据不一致。"
-            )
-            with self._lock:
-                try:
-                    conn = self._get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "UPDATE message_counts SET count = ? WHERE session_id = ?",
-                        (history_length, session_id),
-                    )
-                    conn.commit()
-                    logging.warning(
-                        f"计数器已调整为历史长度 ({history_length})。"
-                    )
-                    return False
-                except sqlite3.Error as e:
-                    logging.error(f"调整会话 {session_id} 计数器时发生数据库错误: {e}")
-                    conn.rollback()
-                    return False
-
-        logging.debug(
-            f"会话 {session_id} 的历史长度 ({history_length}) 与消息计数器 ({current_counter}) 一致。"
-        )
+        logging.debug("已跳过计数器校正，使用持久化计数作为唯一来源")
         return True
 
     def close(self):
