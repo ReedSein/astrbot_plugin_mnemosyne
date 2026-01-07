@@ -93,12 +93,23 @@ async def handle_query_memory(
             logger.warning("context_manager 或 msg_counter 不可用，跳过记忆查询")
             return
 
+        # 在最早阶段清理 Mnemosyne 标签，避免将带标签/异常结构的 contexts 写入会话历史。
+        clean_contexts(plugin, req)
+
         # 判断是否在历史会话管理器中，如果不在，则进行初始化
         if session_id not in plugin.context_manager.conversations:
             plugin.context_manager.init_conv(session_id, req.contexts, event)
 
-        # 清理记忆标签
-        clean_contexts(plugin, req)
+        # 生成供“插件内部记忆/向量化”使用的安全用户文本：
+        # - AstrBot 可能在纯图片消息时令 prompt=None，此处用占位符避免报错
+        # - 不修改 req.prompt，避免影响实际发给 LLM 的内容
+        raw_prompt = req.prompt if isinstance(req.prompt, str) else ""
+        safe_user_prompt = raw_prompt
+        if not safe_user_prompt.strip() and getattr(req, "image_urls", None):
+            safe_user_prompt = "[图片]"
+        # 防御：极端情况下避免将超长文本写入记忆/embedding
+        if len(safe_user_prompt) > 4000:
+            safe_user_prompt = safe_user_prompt[:4000] + "...(truncated)"
 
         # 添加用户消息
         # [Optimization] 移除内存历史记录，仅依赖 msg_counter 计数
@@ -122,12 +133,14 @@ async def handle_query_memory(
 
                 # ===== 提取真实用户消息用于 RAG 搜索 =====
                 # 自动检测并提取（如果不是特殊格式则返回原值）
-                actual_query = ChatroomContextParser.extract_actual_message(req.prompt)
+                actual_query = ChatroomContextParser.extract_actual_message(
+                    safe_user_prompt
+                )
 
-                if actual_query != req.prompt:
+                if actual_query != safe_user_prompt:
                     logger.info(
                         f"检测到群聊上下文格式，已提取真实消息用于 RAG 搜索 "
-                        f"(原始: {len(req.prompt)}字符 → 提取: {len(actual_query)}字符)"
+                        f"(原始: {len(safe_user_prompt)}字符 → 提取: {len(actual_query)}字符)"
                     )
 
                 # 使用 AstrBot EmbeddingProvider 的 embed 方法
@@ -198,7 +211,13 @@ async def handle_on_llm_resp(
         persona_id = await _get_persona_id(plugin, event)
 
         # 判断是否需要总结
-        await _check_and_trigger_summary(plugin, event, session_id, persona_id)
+        await _check_and_trigger_summary(
+            plugin,
+            event,
+            session_id,
+            persona_id,
+            context=plugin.context_manager.get_history(session_id),
+        )
 
         logger.debug(f"返回的内容：{resp.completion_text}")
         # [Optimization] 移除内存历史记录
@@ -454,6 +473,7 @@ async def _check_and_trigger_summary(
     event: AstrMessageEvent,
     session_id: str,
     persona_id: str | None,
+    context: list[dict] | None = None,
 ):
     """
     检查是否满足总结条件并触发总结任务。
@@ -465,6 +485,10 @@ async def _check_and_trigger_summary(
         last_summary_time = plugin.context_manager.get_summary_time(session_id)
 
     history_contents = None
+    if plugin.msg_counter:
+        history_length = len(context) if context is not None else None
+        plugin.msg_counter.adjust_counter_if_necessary(session_id, history_length)
+
     history_contents, _ = await _try_fetch_roaming_history(
         plugin, session_id, last_summary_time
     )
@@ -483,6 +507,11 @@ async def _check_and_trigger_summary(
         and plugin.msg_counter.get_counter(session_id) >= num_pairs * 2
     ):
         logger.info(f"对话已达到 {num_pairs} 轮，开始总结历史对话...")
+
+        if not history_contents and context:
+            history_contents = format_context_to_string(context, num_pairs * 2)
+            if history_contents:
+                logger.info("✅ 使用上下文历史作为总结源数据。")
         
         # [Priority] 优先尝试获取 OneBot 漫游消息
         # 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
@@ -745,7 +774,10 @@ def _process_milvus_hits(hits) -> list[dict[str, Any]]:
 
 # LLM 响应处理相关函数
 def _format_and_inject_memory(
-    plugin: "Mnemosyne", detailed_results: list[dict], req: ProviderRequest, event: AstrMessageEvent
+    plugin: "Mnemosyne",
+    detailed_results: list[dict],
+    req: ProviderRequest,
+    event: AstrMessageEvent | None = None,
 ):
     """
     格式化搜索结果并注入到 ProviderRequest 中。
@@ -802,8 +834,10 @@ def _format_and_inject_memory(
 
     # [Fix] 使用插件共享缓存替代 event.state，避免 AttributeError
     # 直接使用 unified_msg_origin 作为 session_id
-    if hasattr(plugin, "set_memory_data"):
+    if event and hasattr(plugin, "set_memory_data"):
         plugin.set_memory_data(event.unified_msg_origin, long_memory)
+    elif not event:
+        logger.debug("未提供事件对象，跳过记忆缓存注入。")
     else:
         logger.error("Mnemosyne 实例缺少 set_memory_data 方法，记忆无法传递！")
 
@@ -1075,14 +1109,15 @@ async def handle_summary_long_memory(
     """
     # logger = plugin.logger
 
+    # --- 前置检查 ---
+    if not await _check_summary_prerequisites(plugin, memory_text):
+        return
+
     # [Optimization] Acquire semaphore from plugin instance to limit concurrency
     # Fallback to a temporary semaphore if not initialized (though it should be)
     semaphore = getattr(plugin, "summary_semaphore", asyncio.Semaphore(3))
-    
+
     async with semaphore:
-        # --- 前置检查 ---
-        if not await _check_summary_prerequisites(plugin, memory_text):
-            return
 
         try:
             # 1. 请求 LLM 进行总结
