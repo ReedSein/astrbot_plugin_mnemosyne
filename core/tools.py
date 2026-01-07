@@ -4,6 +4,7 @@ Mnemosyne 插件工具函数
 
 import functools
 import re
+from typing import Any
 from urllib.parse import urlparse
 
 from astrbot.api.event import AstrMessageEvent
@@ -45,8 +46,8 @@ def content_to_str(func):
 
 
 def remove_mnemosyne_tags(
-    contents: list[dict[str, str]], contexts_memory_len: int = 0
-) -> list[dict[str, str]]:
+    contents: list[dict[str, Any]], contexts_memory_len: int = 0
+) -> list[dict[str, Any]]:
     """
     使用正则表达式去除LLM上下文中的<mnemosyne> </mnemosyne>标签对。
     - contexts_memory_len > 0: 保留最新的N个标签对。
@@ -57,16 +58,19 @@ def remove_mnemosyne_tags(
         return contents
 
     compiled_regex = re.compile(r"<Mnemosyne>.*?</Mnemosyne>", re.DOTALL)
-    cleaned_contents: list[dict[str, str]] = []
+    cleaned_contents: list[dict[str, Any]] = []
 
     if contexts_memory_len == 0:
         for content_item in contents:
             if isinstance(content_item, dict) and content_item.get("role") == "user":
                 original_text = content_item.get("content", "")
-                if not isinstance(original_text, str):
-                    original_text = str(original_text)
-                cleaned_text = compiled_regex.sub("", original_text)
-                cleaned_contents.append({"role": "user", "content": cleaned_text})
+                # 关键修复：多模态内容（list/dict 等）不能强制转换为字符串。
+                # 只有在 content 为 str 时才需要清理标签。
+                if isinstance(original_text, str):
+                    cleaned_text = compiled_regex.sub("", original_text)
+                    cleaned_contents.append({"role": "user", "content": cleaned_text})
+                else:
+                    cleaned_contents.append(content_item)
             else:
                 cleaned_contents.append(content_item)
     else:  # contexts_memory_len > 0
@@ -180,13 +184,69 @@ def remove_system_content(
 
 
 def format_context_to_string(
-    context_history: list[dict[str, str] | str], length: int = 10
+    context_history: list[dict[str, Any] | str], length: int = 10
 ) -> str:
     """
     从上下文历史记录中提取最后 'length' 条用户和AI的对话消息，
     并将它们的内容转换为结构化的字符串，明确标注角色和时间戳（如果可用）。
     """
     if length <= 0 or not context_history:
+        return ""
+
+    def _truncate_text(text: str, max_chars: int = 2000) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "...(truncated)"
+
+    def _content_to_safe_text(content: Any) -> str:
+        """将 AstrBot/OpenAI 风格上下文内容安全转为文本。"""
+        # 1) 纯文本
+        if isinstance(content, str):
+            if content.startswith("base64://") or content.startswith("data:image"):
+                return "[图片]"
+            return _truncate_text(content)
+
+        # 2) OpenAI 多模态 content blocks
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+
+                item_type = item.get("type")
+
+                if item_type == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(_truncate_text(text))
+                    continue
+
+                if item_type == "image_url" or "image_url" in item:
+                    parts.append("[图片]")
+                    continue
+
+                if item_type == "audio_url" or "audio_url" in item:
+                    parts.append("[音频]")
+                    continue
+
+                if item_type == "think":
+                    continue
+
+                if isinstance(item_type, str) and item_type:
+                    parts.append(f"[{item_type}]")
+
+            merged = " ".join(p for p in parts if p)
+            return merged or ""
+
+        # 3) 其他结构：避免展开潜在大对象
+        if isinstance(content, dict):
+            if "image_url" in content or "audio_url" in content:
+                return "[图片]" if "image_url" in content else "[音频]"
+            text = content.get("text")
+            if isinstance(text, str):
+                return _truncate_text(text)
+            return ""
+
         return ""
 
     selected_contents: list[str] = []
@@ -218,15 +278,7 @@ def format_context_to_string(
                 role = raw_role.capitalize() if raw_role else "Unknown"
 
             content_obj = message.get("content", "")
-            # 处理多模态内容列表
-            if isinstance(content_obj, list):
-                text_parts = []
-                for part in content_obj:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(str(part.get("text", "")))
-                content = "".join(text_parts)
-            else:
-                content = str(content_obj)
+            content = _content_to_safe_text(content_obj)
             
             # 尝试获取时间戳
             ts = message.get("timestamp") or message.get("created_at") or message.get("time")
@@ -250,7 +302,7 @@ def format_context_to_string(
                 role = "Rosa"
             else: role = "Unknown"
             
-            content = str(getattr(message, "content", ""))
+            content = _content_to_safe_text(getattr(message, "content", ""))
             timestamp_str = "" # 对象通常不带时间戳，除非我们去查库
 
         if content:
