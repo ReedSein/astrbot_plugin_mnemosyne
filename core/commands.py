@@ -763,7 +763,7 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
         history_str = roaming_content
         logger.info(
             f"🔧 [Debug] 成功通过核心逻辑 (_try_fetch_roaming_history) 拉取到漫游消息 "
-            f"(新消息: {roaming_count})。"
+            f"(群内新消息: {roaming_count})。"
         )
     else:
         logger.info(f"🔧 [Debug] 核心逻辑未返回漫游消息，尝试从 AstrBot 核心数据库拉取...")
