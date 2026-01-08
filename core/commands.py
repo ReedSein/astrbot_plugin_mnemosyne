@@ -753,11 +753,18 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
     # 尝试使用核心逻辑获取漫游消息
     # 注意：这里我们传入 last_summary_time，以便测试增量获取逻辑
     # 如果想测试全量，可以临时修改 last_summary_time 为 0，但为了模拟真实情况，保持原样
-    roaming_content = await _try_fetch_roaming_history(self, session_id, last_summary_time)
+    (
+        roaming_content,
+        roaming_count,
+        roaming_latest_time,
+    ) = await _try_fetch_roaming_history(self, session_id, last_summary_time)
     
     if roaming_content:
         history_str = roaming_content
-        logger.info(f"🔧 [Debug] 成功通过核心逻辑 (_try_fetch_roaming_history) 拉取到漫游消息。")
+        logger.info(
+            f"🔧 [Debug] 成功通过核心逻辑 (_try_fetch_roaming_history) 拉取到漫游消息 "
+            f"(新消息: {roaming_count})。"
+        )
     else:
         logger.info(f"🔧 [Debug] 核心逻辑未返回漫游消息，尝试从 AstrBot 核心数据库拉取...")
         
@@ -815,7 +822,7 @@ async def debug_summary_cmd_impl(self: "Mnemosyne", event: AstrMessageEvent):
             logger.info(f"🔧 [Debug] 已重置会话 {session_id} 的消息计数器。")
         
         if self.context_manager:
-            self.context_manager.update_summary_time(session_id)
+            self.context_manager.update_summary_time(session_id, roaming_latest_time)
             logger.info(f"🔧 [Debug] 已更新会话 {session_id} 的最后总结时间。")
         
         yield event.plain_result(
