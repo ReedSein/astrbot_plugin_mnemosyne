@@ -33,8 +33,15 @@ class ConversationContextManager:
             # [Optimization] 移除内存历史记录
             # self.conversations[session_id]["history"] = contexts
             self.conversations[session_id]["event"] = event
-            # 初始化最后一次总结的时间
-            self.conversations[session_id]["last_summary_time"] = time.time()
+            # 初始化最后一次总结的时间（对齐 OneBot/NapCat 的秒级时间戳）
+            last_summary_time = 0
+            try:
+                last_summary_time = int(event.message_obj.timestamp) - 1
+            except Exception:
+                last_summary_time = int(time.time()) - 1
+            if last_summary_time < 0:
+                last_summary_time = 0
+            self.conversations[session_id]["last_summary_time"] = last_summary_time
             return
 
     def add_message(self, session_id: str, role: str, content: str) -> str | None:
@@ -49,7 +56,7 @@ class ConversationContextManager:
             if session_id not in self.conversations:
                 self.conversations[session_id] = {
                     # "history": [], # [Optimization] 移除
-                    "last_summary_time": time.time(),
+                    "last_summary_time": int(time.time()),
                 }
             
             # [Optimization] 不再追加历史记录
@@ -67,13 +74,21 @@ class ConversationContextManager:
             else:
                 return 0
 
-    def update_summary_time(self, session_id: str):
+    def update_summary_time(self, session_id: str, summary_time: int | float | None = None):
         """
         更新最后一次总结时间
         """
         with self._lock:
             if session_id in self.conversations:
-                self.conversations[session_id]["last_summary_time"] = time.time()
+                if summary_time is None:
+                    summary_time = int(time.time())
+                try:
+                    summary_time_int = int(summary_time)
+                except (TypeError, ValueError):
+                    summary_time_int = int(time.time())
+                if summary_time_int < 0:
+                    summary_time_int = 0
+                self.conversations[session_id]["last_summary_time"] = summary_time_int
 
     def get_history(self, session_id: str) -> list[dict]:
         """
