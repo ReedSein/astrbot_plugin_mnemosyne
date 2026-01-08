@@ -204,7 +204,7 @@
     },
     "summary_llm_config":{
         "description":"总结 LLM 调用参数",
-        "type":"dict",
+        "type":"object",
         "hint":"将作为 kwargs 传入总结用 provider 的 text_chat；不同 provider 支持的参数不同。timeout 仅用于本插件的超时控制。",
         "items":{},
         "default":{},
