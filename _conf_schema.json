@@ -65,7 +65,7 @@
     "summary_check_task":{
         "description":"自动总结计时器设置",
         "type":"object",
-        "hint":"实验性功能：定时检查是否需要进行“漫游增量总结”。不受 num_pairs 影响；若设置了 min_messages_threshold>0，则需要 OneBot/NapCat 漫游新消息条数达到阈值才会总结。总结内容来源于 OneBot/NapCat 群聊漫游（见 onebot_roaming_settings），漫游不可用/失败则跳过本次总结。",
+        "hint":"实验性功能：定时检查是否需要进行“漫游增量总结”。不受 num_pairs 影响；若设置了 min_messages_threshold>0，则需要 OneBot/NapCat 漫游的群内新消息条数达到阈值才会总结。总结内容来源于 OneBot/NapCat 群聊漫游（见 onebot_roaming_settings），漫游不可用/失败则跳过本次总结。",
         "obvious_hint":true,
         "items":{
             "SUMMARY_CHECK_INTERVAL_SECONDS":{
@@ -119,7 +119,7 @@
     "num_pairs":{
         "description":"记忆总结的对话轮数",
         "type":"int",
-        "hint":"用于“触发检查”的对话轮次计数（1轮=一问一答）。当轮次达到此阈值时会触发一次总结检查；若同时设置了 min_messages_threshold>0，则还需要 OneBot/NapCat 漫游的新消息条数达到阈值才会真正总结，否则本次不总结并等待下一次轮次触发再检查。",
+        "hint":"用于“触发检查”的对话轮次计数（1轮=一问一答）。当轮次达到此阈值时会触发一次总结检查；若同时设置了 min_messages_threshold>0，则还需要 OneBot/NapCat 漫游的群内新消息条数达到阈值才会真正总结，否则本次不总结并等待下一次轮次触发再检查。",
         "obvious_hint":false,
         "default":5,
         "minimum":1,
@@ -128,7 +128,7 @@
     "min_messages_threshold":{
         "description":"最小消息数阈值",
         "type":"int",
-        "hint":"按“距上次总结后的漫游新消息条数”判断是否允许总结（OneBot/NapCat 群聊漫游）。对话触发：需先满足 num_pairs 才会检查该阈值；定时任务：不受 num_pairs 影响，直接检查该阈值。达到阈值才会总结并写入长期记忆；不足则等待下一次触发再检查。0 表示不额外限制。",
+        "hint":"按“距上次总结后的群内新消息条数”判断是否允许总结（OneBot/NapCat 群聊漫游）。对话触发：需先满足 num_pairs 才会检查该阈值；定时任务：不受 num_pairs 影响，直接检查该阈值。达到阈值才会总结并写入长期记忆；不足则等待下一次触发再检查。0 表示不额外限制。",
         "obvious_hint":true,
         "default":0,
         "minimum":0
