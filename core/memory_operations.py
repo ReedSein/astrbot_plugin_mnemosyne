@@ -49,13 +49,6 @@ async def handle_query_memory(
     """
     # logger = plugin.logger
 
-    # --- 前置检查 ---
-    if not await _check_rag_prerequisites(plugin):
-        # [Fallback] 即使前置检查失败，也要确保重置当前会话的记忆缓存，防止脏读
-        if hasattr(plugin, "set_memory_data"):
-            plugin.set_memory_data(event.unified_msg_origin, "")
-        return
-
     try:
         # [Init] 初始化缓存为空，确保默认安全
         if hasattr(plugin, "set_memory_data"):
@@ -116,6 +109,10 @@ async def handle_query_memory(
         # plugin.context_manager.add_message(session_id, "user", req.prompt)
         # 计数器+1
         plugin.msg_counter.increment_counter(session_id)
+
+        # --- RAG 前置检查（只影响检索注入，不影响总结计数/漫游所需 event 绑定） ---
+        if not await _check_rag_prerequisites(plugin):
+            return
 
         # --- RAG 搜索 ---
         detailed_results = []
@@ -210,6 +207,9 @@ async def handle_on_llm_resp(
             return
         persona_id = await _get_persona_id(plugin, event)
 
+        # 先计数再判断阈值，避免总结触发滞后一轮
+        plugin.msg_counter.increment_counter(session_id)
+
         # 判断是否需要总结
         await _check_and_trigger_summary(
             plugin,
@@ -222,7 +222,6 @@ async def handle_on_llm_resp(
         logger.debug(f"返回的内容：{resp.completion_text}")
         # [Optimization] 移除内存历史记录
         # plugin.context_manager.add_message(session_id, "assistant", resp.completion_text)
-        plugin.msg_counter.increment_counter(session_id)
 
     except Exception as e:
         logger.error(f"处理 LLM 响应后的记忆记录失败: {e}", exc_info=True)
@@ -294,7 +293,7 @@ async def _get_persona_id(plugin: "Mnemosyne", event: AstrMessageEvent) -> str |
 
 async def _try_fetch_roaming_history(
     plugin: "Mnemosyne", session_id: str, last_summary_time: float
-) -> tuple[str | None, int | None]:
+) -> tuple[str | None, int | None, int | None]:
     """
     [OneBot 漫游消息支持] 分页回溯获取漫游消息
     逻辑：从最新消息开始，利用 message_id 倒序向前拉取，直到时间戳衔接上 last_summary_time。
@@ -303,7 +302,7 @@ async def _try_fetch_roaming_history(
         # 1. 检查配置是否启用
         roaming_conf = plugin.config.get("onebot_roaming_settings", {})
         if not roaming_conf.get("enable", True):
-            return None, None
+            return None, None, None
         
         # 2. 解析上下文
         if plugin.context_manager:
@@ -314,12 +313,25 @@ async def _try_fetch_roaming_history(
                 platform_name = event.get_platform_name()
                 client = getattr(event, "bot", None)
             else:
-                return None, None
+                return None, None, None
         else:
-            return None, None
+            return None, None, None
 
         if platform_name != "aiocqhttp" or not group_id or not client:
-            return None, None
+            return None, None, None
+
+        async def _call_onebot_action(action: str, **params):
+            """
+            兼容不同 OneBot/AstrBot 适配层的 action 调用方式：
+            - 某些实现暴露为 `bot.call_action`
+            - 某些实现暴露为 `bot.api.call_action`
+            """
+            if hasattr(client, "call_action") and callable(getattr(client, "call_action")):
+                return await client.call_action(action, **params)
+            api = getattr(client, "api", None)
+            if api and hasattr(api, "call_action") and callable(getattr(api, "call_action")):
+                return await api.call_action(action, **params)
+            return None
 
         # 3. 初始化分页参数
         # 从配置读取参数
@@ -346,57 +358,69 @@ async def _try_fetch_roaming_history(
             current_round += 1
             
             # 调用 API
-            if hasattr(client, "api") and hasattr(client.api, "call_action"):
-                # 注意：不同 OneBot 实现对 get_group_msg_history 参数支持不同
-                # NapCat/Lagrange: group_id, message_id (起始ID), count
-                # message_id=0 通常意味着获取最新的
-                try:
-                    params = {"group_id": int(group_id), "count": BATCH_SIZE}
-                    if cursor_msg_id != 0:
-                        # 获取 cursor 之前的消息
-                        params["message_id"] = int(cursor_msg_id)
-                    
-                    resp_data = await client.api.call_action("get_group_msg_history", **params)
-                except Exception as e:
-                    logger.warning(f"API 调用失败 (Round {current_round}): {e}")
+            # 注意：不同 OneBot 实现对 get_group_msg_history 参数支持不同
+            # NapCat/Lagrange: group_id, message_id (起始ID), count
+            # message_id=0 通常意味着获取最新的
+            try:
+                params = {
+                    "group_id": int(group_id)
+                    if str(group_id).isdigit()
+                    else group_id,
+                    "count": BATCH_SIZE,
+                }
+                if cursor_msg_id != 0:
+                    # 获取 cursor 之前的消息
+                    params["message_id"] = int(cursor_msg_id)
+
+                resp_data = await _call_onebot_action(
+                    "get_group_msg_history", **params
+                )
+                if resp_data is None:
+                    logger.warning(
+                        "未找到可用的 OneBot call_action 接口，无法拉取漫游消息。"
+                    )
                     break
+            except Exception as e:
+                logger.warning(f"API 调用失败 (Round {current_round}): {e}")
+                break
                 
-                if not resp_data or "messages" not in resp_data:
-                    break
-                
-                batch_msgs = resp_data["messages"]
-                if not batch_msgs:
-                    break
-                    
-                # OneBot 返回的消息列表通常是 [旧 -> 新] 的顺序
-                # 我们需要找到这批消息里最老的一条，作为下一轮的 cursor
-                
-                # 预处理：按时间倒序排列方便检查
-                batch_msgs.sort(key=lambda x: x.get("time", 0), reverse=True)
-                
-                # 检查时间戳覆盖情况
-                batch_min_time = batch_msgs[-1].get("time", 0)
-                batch_max_time = batch_msgs[0].get("time", 0)
-                
-                logger.debug(f"  Batch {current_round}: 获取 {len(batch_msgs)} 条 (Time: {datetime.fromtimestamp(batch_min_time)} - {datetime.fromtimestamp(batch_max_time)})")
-                
-                # 收集消息
-                all_raw_msgs.extend(batch_msgs)
-                
-                # 更新 cursor: 取这批消息里最小的 message_id
-                # 注意：要找 message_id 最小的（通常也是最旧的）
-                # 这里我们假设 batch_msgs[-1] 是最旧的
-                cursor_msg_id = batch_msgs[-1].get("message_id")
-                
-                # 检查是否已经覆盖到了 last_summary_time
-                if batch_min_time <= last_summary_time:
-                    logger.debug("  -> 已回溯到上次总结的时间点，停止拉取。")
-                    break
-                
-                if len(all_raw_msgs) >= MAX_TOTAL_MSG:
-                    logger.info("  -> 达到最大消息数量限制，停止拉取。")
-                    break
-            else:
+            if not resp_data or "messages" not in resp_data:
+                break
+
+            batch_msgs = resp_data["messages"]
+            if not batch_msgs:
+                break
+
+            # OneBot 返回的消息列表通常是 [旧 -> 新] 的顺序
+            # 我们需要找到这批消息里最老的一条，作为下一轮的 cursor
+
+            # 预处理：按时间倒序排列方便检查
+            batch_msgs.sort(key=lambda x: x.get("time", 0), reverse=True)
+
+            # 检查时间戳覆盖情况
+            batch_min_time = batch_msgs[-1].get("time", 0)
+            batch_max_time = batch_msgs[0].get("time", 0)
+
+            logger.debug(
+                f"  Batch {current_round}: 获取 {len(batch_msgs)} 条 "
+                f"(Time: {datetime.fromtimestamp(batch_min_time)} - {datetime.fromtimestamp(batch_max_time)})"
+            )
+
+            # 收集消息
+            all_raw_msgs.extend(batch_msgs)
+
+            # 更新 cursor: 取这批消息里最小的 message_id
+            # 注意：要找 message_id 最小的（通常也是最旧的）
+            # 这里我们假设 batch_msgs[-1] 是最旧的
+            cursor_msg_id = batch_msgs[-1].get("message_id")
+
+            # 检查是否已经覆盖到了 last_summary_time
+            if batch_min_time <= last_summary_time:
+                logger.debug("  -> 已回溯到上次总结的时间点，停止拉取。")
+                break
+
+            if len(all_raw_msgs) >= MAX_TOTAL_MSG:
+                logger.info("  -> 达到最大消息数量限制，停止拉取。")
                 break
         
         # 4. 数据清洗与过滤
@@ -405,44 +429,167 @@ async def _try_fetch_roaming_history(
         sorted_msgs = sorted(unique_msgs, key=lambda x: x.get("time", 0))
         
         filtered_history = []
-        self_id = str(client.self_id) if hasattr(client, "self_id") else ""
+        self_id = str(getattr(client, "self_id", "") or "")
+        if not self_id:
+            api = getattr(client, "api", None)
+            self_id = str(getattr(api, "self_id", "") or "")
 
-        def _is_relevant_message(msg: dict, bot_id: str) -> bool:
-            """仅统计机器人自己发送的消息，忽略仅@机器人但机器人沉默的情况。"""
+        def _is_from_bot(msg: dict, bot_id: str) -> bool:
             sender = msg.get("sender", {})
+            if not isinstance(sender, dict):
+                return False
             sender_user_id = str(sender.get("user_id", ""))
             return bool(bot_id and sender_user_id == bot_id)
+
+        def _mentions_bot(msg: dict, bot_id: str) -> bool:
+            if not bot_id:
+                return False
+            msg_chain = msg.get("message", [])
+            if isinstance(msg_chain, list):
+                for seg in msg_chain:
+                    if not isinstance(seg, dict):
+                        continue
+                    if seg.get("type") != "at":
+                        continue
+                    data = seg.get("data", {})
+                    if not isinstance(data, dict):
+                        continue
+                    qq = data.get("qq")
+                    if qq is None:
+                        continue
+                    if str(qq) == bot_id:
+                        return True
+
+            raw = msg.get("raw_message", "")
+            if isinstance(raw, str) and raw and "CQ:at" in raw and bot_id in raw:
+                return True
+            return False
+
+        def _extract_message_text(msg: dict, bot_id: str) -> str:
+            def _truncate(text: str, max_chars: int = 2000) -> str:
+                if len(text) <= max_chars:
+                    return text
+                return text[:max_chars] + "...(truncated)"
+
+            msg_chain = msg.get("message", [])
+            if isinstance(msg_chain, list):
+                parts: list[str] = []
+                for seg in msg_chain:
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_type = seg.get("type")
+                    data = seg.get("data", {})
+                    if not isinstance(data, dict):
+                        data = {}
+
+                    if seg_type == "text":
+                        text = data.get("text")
+                        if isinstance(text, str) and text:
+                            parts.append(text)
+                        continue
+
+                    if seg_type == "at":
+                        qq = data.get("qq")
+                        if qq is None:
+                            continue
+                        qq_str = str(qq)
+                        if bot_id and qq_str == bot_id:
+                            parts.append("@bot")
+                        else:
+                            parts.append(f"@{qq_str}")
+                        continue
+
+                    if seg_type == "image":
+                        parts.append("[图片]")
+                        continue
+                    if seg_type == "record":
+                        parts.append("[语音]")
+                        continue
+                    if seg_type == "video":
+                        parts.append("[视频]")
+                        continue
+                    if seg_type == "file":
+                        parts.append("[文件]")
+                        continue
+                    if seg_type == "reply":
+                        parts.append("[回复]")
+                        continue
+
+                merged = "".join(parts).strip()
+                return _truncate(merged) if merged else "[非文本消息]"
+
+            if isinstance(msg_chain, str) and msg_chain.strip():
+                return _truncate(msg_chain.strip())
+
+            raw = msg.get("raw_message", "")
+            if isinstance(raw, str) and raw.strip():
+                return _truncate(raw.strip())
+
+            return "[非文本消息]"
+
+        selected = [False] * len(sorted_msgs)
+
+        for idx, msg in enumerate(sorted_msgs):
+            msg_time = msg.get("time", 0)
+            if msg_time <= last_summary_time:
+                continue
+            if _is_from_bot(msg, self_id) or _mentions_bot(msg, self_id):
+                selected[idx] = True
+
+        # 若 bot 发言但上一条用户消息未被选中，则补齐上一条，尽量保留问答对
+        for idx, msg in enumerate(sorted_msgs):
+            msg_time = msg.get("time", 0)
+            if msg_time <= last_summary_time:
+                continue
+            if not _is_from_bot(msg, self_id):
+                continue
+            prev_idx = idx - 1
+            if prev_idx < 0:
+                continue
+            prev_msg = sorted_msgs[prev_idx]
+            prev_time = prev_msg.get("time", 0)
+            if prev_time <= last_summary_time:
+                continue
+            if _is_from_bot(prev_msg, self_id):
+                continue
+            selected[prev_idx] = True
         
-        for msg in sorted_msgs:
+        latest_msg_time = 0
+        for idx, msg in enumerate(sorted_msgs):
+            if not selected[idx]:
+                continue
             msg_time = msg.get("time", 0)
             
             # [关键过滤] 再次精确过滤，只保留晚于上次总结时间的消息
             if msg_time <= last_summary_time:
                 continue
+            try:
+                msg_time_int = int(msg_time)
+            except (TypeError, ValueError):
+                msg_time_int = 0
+            if msg_time_int > latest_msg_time:
+                latest_msg_time = msg_time_int
 
-            if not _is_relevant_message(msg, self_id):
-                continue
-                
-            sender = msg.get("sender", {})
-            sender_user_id = str(sender.get("user_id", ""))
-            
+            sender = msg.get("sender")
+            if not isinstance(sender, dict):
+                sender = {}
+
+            sender_user_id = str(sender.get("user_id", "") or "")
+
             role = "user"
             if sender_user_id == self_id:
                 role = "assistant"
-            
-            name = sender.get("card") or sender.get("nickname") or sender_user_id
+
+            nickname = str(sender.get("card") or sender.get("nickname") or "").strip()
+            if nickname and sender_user_id:
+                name = f"{nickname}({sender_user_id})"
+            else:
+                name = sender_user_id or nickname or "unknown"
             
             # 提取内容
-            content = msg.get("raw_message", "")
-            if not content and "message" in msg:
-                msg_chain = msg.get("message", [])
-                if isinstance(msg_chain, list):
-                    content = "".join([str(seg.get("data", {}).get("text", "")) for seg in msg_chain if seg.get("type") == "text"])
-                elif isinstance(msg_chain, str):
-                    content = msg_chain
-            if not content: content = "[非文本消息]"
+            content = _extract_message_text(msg, self_id)
             
-            timestamp = datetime.fromtimestamp(msg_time).strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = datetime.fromtimestamp(msg_time_int).strftime("%Y-%m-%d %H:%M:%S")
             
             filtered_history.append({
                 "role": role,
@@ -458,14 +605,15 @@ async def _try_fetch_roaming_history(
             return (
                 format_context_to_string(filtered_history, len(filtered_history)),
                 len(filtered_history),
+                latest_msg_time or None,
             )
         else:
-            return None, 0
+            return None, 0, None
             
     except Exception as e:
         logger.warning(f"🔧 [OneBot Roaming] 获取漫游消息失败: {e}")
-        return None, None
-    return None, None
+        return None, None, None
+    return None, None, None
 
 
 async def _check_and_trigger_summary(
@@ -480,106 +628,106 @@ async def _check_and_trigger_summary(
     """
     # M24 修复: 添加 msg_counter 的类型检查
     num_pairs = plugin.config.get("num_pairs", 5)
+    min_messages_threshold = plugin.config.get("min_messages_threshold", 0)
+    try:
+        min_messages_threshold = int(min_messages_threshold)
+    except (TypeError, ValueError):
+        min_messages_threshold = 0
+    if min_messages_threshold < 0:
+        min_messages_threshold = 0
+
     last_summary_time = 0
     if plugin.context_manager:
         last_summary_time = plugin.context_manager.get_summary_time(session_id)
 
     history_contents = None
+    counter = 0
     if plugin.msg_counter:
         history_length = len(context) if context is not None else None
         plugin.msg_counter.adjust_counter_if_necessary(session_id, history_length)
+        counter = plugin.msg_counter.get_counter(session_id)
 
-    history_contents, _ = await _try_fetch_roaming_history(
-        plugin, session_id, last_summary_time
-    )
+    pair_threshold = num_pairs * 2
+    effective_threshold = pair_threshold
+    if min_messages_threshold > 0:
+        effective_threshold = max(effective_threshold, min_messages_threshold)
+
     # 如果重启后（last_summary_time=0）计数器已超过阈值，直接重置，避免启动即触发总结
     if last_summary_time == 0 and plugin.msg_counter:
-        threshold = num_pairs * 2
-        if plugin.msg_counter.get_counter(session_id) >= threshold:
+        if counter >= effective_threshold:
             logger.info(
-                f"⚖️ 检测到重启后计数器 {plugin.msg_counter.get_counter(session_id)} 已超过阈值 {threshold}，重置计数器。"
+                f"⚖️ 检测到重启后计数器 {counter} 已超过阈值 {effective_threshold}，重置计数器。"
             )
             plugin.msg_counter.reset_counter(session_id)
             return
 
-    if (
-        plugin.msg_counter
-        and plugin.msg_counter.get_counter(session_id) >= num_pairs * 2
-    ):
-        logger.info(f"对话已达到 {num_pairs} 轮，开始总结历史对话...")
+    if not plugin.msg_counter:
+        return
 
-        if not history_contents and context:
-            history_contents = format_context_to_string(context, num_pairs * 2)
-            if history_contents:
-                logger.info("✅ 使用上下文历史作为总结源数据。")
-        
-        # [Priority] 优先尝试获取 OneBot 漫游消息
-        # 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
-        if not history_contents:
-            logger.warning(f"⚠️ OneBot 漫游消息获取失败，尝试从 AstrBot 核心数据库拉取...")
-            try:
-                conv_mgr = plugin.context.conversation_manager
-                curr_cid = await conv_mgr.get_curr_conversation_id(session_id)
-                if curr_cid:
-                    conversation = await conv_mgr.get_conversation(session_id, curr_cid)
-                    if conversation and conversation.history:
-                        import json
-                        history_list = []
-                        if isinstance(conversation.history, str):
-                            history_list = json.loads(conversation.history)
-                        elif isinstance(conversation.history, list):
-                            history_list = conversation.history
-                        
-                        if history_list:
-                            # 仅截取最近的部分，避免过长
-                            history_contents = format_context_to_string(history_list, num_pairs * 2)
-                            logger.info(f"✅ 使用 AstrBot 核心数据库历史作为总结源数据。")
-            except Exception as e:
-                logger.error(f"从 AstrBot 核心数据库拉取历史失败: {e}")
+    if counter < pair_threshold:
+        return
 
-        if not history_contents:
-            logger.error(f"❌ 无法获取任何历史记录（漫游失败且核心数据库为空），跳过本次总结。")
-            # 重置计数器以防止死循环尝试
-            if plugin.msg_counter:
-                plugin.msg_counter.reset_counter(session_id)
-            return
-        else:
-             if not history_contents.startswith("✅"): # 避免重复打印日志
-                logger.info(f"✅ 使用 OneBot 漫游消息作为总结源数据。")
+    history_contents, roaming_new_count, roaming_latest_time = await _try_fetch_roaming_history(
+        plugin, session_id, last_summary_time
+    )
 
-        # M19 修复: 为后台任务添加异常处理回调
-        task = asyncio.create_task(
-            handle_summary_long_memory(plugin, persona_id, session_id, history_contents)
+    # 总结完全依赖 OneBot/NapCat 漫游：不可用/失败则跳过（等待下次触发再检查）
+    if roaming_new_count is None:
+        logger.warning(
+            "⚠️ OneBot 漫游消息不可用或拉取失败，跳过本次总结（不会回退到核心历史）。"
         )
-        
-        # 更新总结时间
-        if plugin.context_manager:
-            plugin.context_manager.update_summary_time(session_id)
+        return
 
-        # [Visual Log] 显式日志：对话轮数触发总结
-        logger.info("="*40)
-        logger.info(f"⏰ [Mnemosyne] 触发记忆总结 (机制: 对话轮数)")
-        logger.info(f"📊 进度对比: {plugin.msg_counter.get_counter(session_id)} / {num_pairs * 2} (消息数)")
-        logger.info(f"🆔 Session: {session_id}")
-        logger.info("="*40)
+    if min_messages_threshold > 0 and roaming_new_count < min_messages_threshold:
+        logger.info(
+            f"🔧 [Mnemosyne] 漫游新消息数 {roaming_new_count} 未达到最小阈值 "
+            f"{min_messages_threshold}，本次不总结（等待后续触发）。"
+        )
+        return
 
-        def task_done_callback(t: asyncio.Task):
-            """后台任务完成时的回调，用于捕获未处理的异常"""
-            try:
-                # 获取任务结果，如果有异常会在这里抛出
-                t.result()
-            except asyncio.CancelledError:
-                logger.info(f"总结任务被取消 (session: {session_id})")
-            except Exception as e:
-                logger.error(
-                    f"后台总结任务执行失败 (session: {session_id}): {e}", exc_info=True
-                )
+    if not history_contents:
+        logger.info("🔧 [Mnemosyne] 漫游未返回可用于总结的新消息，本次跳过。")
+        return
 
-        task.add_done_callback(task_done_callback)
-        logger.info("总结历史对话任务已提交到后台执行。")
-        # M24 修复: 添加类型检查
-        if plugin.msg_counter:
-            plugin.msg_counter.reset_counter(session_id)
+    logger.info("对话已达到总结阈值，开始总结历史对话（来源: OneBot 漫游）...")
+
+    # M19 修复: 为后台任务添加异常处理回调
+    task = asyncio.create_task(
+        handle_summary_long_memory(plugin, persona_id, session_id, history_contents)
+    )
+
+    # 更新总结时间
+    if plugin.context_manager:
+        plugin.context_manager.update_summary_time(session_id, roaming_latest_time)
+
+    # [Visual Log] 显式日志：对话轮数触发总结
+    logger.info("=" * 40)
+    logger.info("⏰ [Mnemosyne] 触发记忆总结 (机制: 对话轮数)")
+    logger.info(f"📊 计数器: {counter} / {pair_threshold} (消息数)")
+    if min_messages_threshold > 0:
+        logger.info(
+            f"📊 漫游新消息: {roaming_new_count} / {min_messages_threshold} (阈值)"
+        )
+    else:
+        logger.info(f"📊 漫游新消息: {roaming_new_count} (条)")
+    logger.info(f"🆔 Session: {session_id}")
+    logger.info("=" * 40)
+
+    def task_done_callback(t: asyncio.Task):
+        """后台任务完成时的回调，用于捕获未处理的异常"""
+        try:
+            # 获取任务结果，如果有异常会在这里抛出
+            t.result()
+        except asyncio.CancelledError:
+            logger.info(f"总结任务被取消 (session: {session_id})")
+        except Exception as e:
+            logger.error(
+                f"后台总结任务执行失败 (session: {session_id}): {e}", exc_info=True
+            )
+
+    task.add_done_callback(task_done_callback)
+    logger.info("总结历史对话任务已提交到后台执行。")
+    plugin.msg_counter.reset_counter(session_id)
 
 
 async def _perform_milvus_search(
@@ -911,7 +1059,7 @@ async def _check_summary_prerequisites(plugin: "Mnemosyne", memory_text: str) ->
 
 
 async def _get_summary_llm_response(
-    plugin: "Mnemosyne", memory_text: str
+    plugin: "Mnemosyne", memory_text: str, session_id: str | None = None
 ) -> LLMResponse | None:
     """
     请求 LLM 进行记忆总结。
@@ -924,24 +1072,29 @@ async def _get_summary_llm_response(
         LLMResponse 对象，如果请求失败则为 None。
     """
     # logger = plugin.logger
-    llm_provider = plugin.provider
-    # TODO: 优化LLM Provider获取逻辑，确保在plugin.provider不可用时能正确回退到当前使用的Provider
-    try:
+    llm_provider = None
+    provider_id = plugin.config.get("LLM_providers", "")
+    if isinstance(provider_id, str) and provider_id.strip():
+        llm_provider = plugin.context.get_provider_by_id(provider_id.strip())
         if not llm_provider:
-            # 如果plugin.provider不正确，在这时候，使用当前使用的LLM服务商，避免错误
-            llm_provider = plugin.context.get_using_provider()
-            if not llm_provider:
-                logger.error("无法获取用于总结记忆的 LLM Provider。")
-                return None
-    except Exception as e:
-        logger.error(f"获取 LLM Provider 时出错: {e}", exc_info=True)
-        return None
+            logger.warning(
+                f"无法找到 LLM_providers='{provider_id}' 对应的 provider，将回退到当前会话默认 provider。"
+            )
+
+    if not llm_provider:
+        try:
+            llm_provider = plugin.context.get_using_provider(umo=session_id)
+        except Exception as e:
+            logger.error(f"获取当前会话默认 provider 失败: {e}", exc_info=True)
+            return None
 
     long_memory_prompt = plugin.config.get(
         "long_memory_prompt",
         "请将以下多轮对话历史总结为一段简洁、客观、包含关键信息的长期记忆条目:",
     )
     summary_llm_config = plugin.config.get("summary_llm_config", {})
+    if not isinstance(summary_llm_config, dict):
+        summary_llm_config = {}
 
     logger.debug(
         f"请求 LLM 总结短期记忆，提示: '{long_memory_prompt[:50]}...', 内容长度: {len(memory_text)}"
@@ -949,13 +1102,24 @@ async def _get_summary_llm_response(
 
     try:
         # M24 修复: 添加 text_chat 方法的类型忽略
-        llm_response = await llm_provider.text_chat(  # type: ignore
+        timeout = summary_llm_config.pop("timeout", None)
+
+        call_coro = llm_provider.text_chat(  # type: ignore
             prompt=memory_text,
             contexts=[{"role": "system", "content": long_memory_prompt}],
             **summary_llm_config,
         )
+
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            llm_response = await asyncio.wait_for(call_coro, timeout=float(timeout))
+        else:
+            llm_response = await call_coro
+
         logger.debug(f"LLM 总结响应原始数据: {llm_response}")
         return llm_response
+    except asyncio.TimeoutError:
+        logger.error("LLM 总结请求超时")
+        return None
     except Exception as e:
         logger.error(f"LLM 总结请求失败: {e}", exc_info=True)
         return None
@@ -1121,7 +1285,9 @@ async def handle_summary_long_memory(
 
         try:
             # 1. 请求 LLM 进行总结
-            llm_response = await _get_summary_llm_response(plugin, memory_text)
+            llm_response = await _get_summary_llm_response(
+                plugin, memory_text, session_id=session_id
+            )
             if not llm_response:
                 return
 
@@ -1211,12 +1377,21 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                     if not session_context:  # 会话可能在检查期间被移除
                         continue
                     # M24 修复: 添加 msg_counter 的类型检查
-                    if (
-                        not plugin.msg_counter
-                        or plugin.msg_counter.get_counter(session_id) <= 0
-                    ):
+                    if not plugin.msg_counter:
+                        continue
+
+                    counter = plugin.msg_counter.get_counter(session_id)
+                    if counter <= 0:
                         logger.debug(f"会话 {session_id} 没有新消息，跳过检查。")
                         continue
+
+                    min_messages_threshold = plugin.config.get("min_messages_threshold", 0)
+                    try:
+                        min_messages_threshold = int(min_messages_threshold)
+                    except (TypeError, ValueError):
+                        min_messages_threshold = 0
+                    if min_messages_threshold < 0:
+                        min_messages_threshold = 0
 
                     last_summary_time = session_context["last_summary_time"]
 
@@ -1232,47 +1407,35 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                         logger.info("="*40)
                         
                         # 运行总结
-                        logger.info("开始总结历史对话...")
+                        logger.info("开始总结历史对话（来源: OneBot 漫游）...")
                         
                         # [Priority] 优先尝试获取 OneBot 漫游消息
-                        history_contents, _ = await _try_fetch_roaming_history(
+                        history_contents, roaming_new_count, roaming_latest_time = await _try_fetch_roaming_history(
                             plugin, session_id, last_summary_time
                         )
+
+                        if roaming_new_count is None:
+                            logger.debug(
+                                f"⚠️ OneBot 漫游消息不可用或拉取失败 (session: {session_id})，跳过总结。"
+                            )
+                            continue
+
+                        if (
+                            min_messages_threshold > 0
+                            and roaming_new_count < min_messages_threshold
+                        ):
+                            logger.debug(
+                                f"🔧 [Mnemosyne] 会话 {session_id} 漫游新消息数 "
+                                f"{roaming_new_count} < 最小阈值 "
+                                f"{min_messages_threshold}，跳过总结。"
+                            )
+                            continue
                         
-                        # [Fallback] 如果漫游消息获取失败，尝试从 AstrBot 核心数据库拉取
                         if not history_contents:
-                            logger.warning(f"⚠️ OneBot 漫游消息获取失败 (定时任务)，尝试从 AstrBot 核心数据库拉取...")
-                            try:
-                                conv_mgr = plugin.context.conversation_manager
-                                curr_cid = await conv_mgr.get_curr_conversation_id(session_id)
-                                if curr_cid:
-                                    conversation = await conv_mgr.get_conversation(session_id, curr_cid)
-                                    if conversation and conversation.history:
-                                        import json
-                                        history_list = []
-                                        if isinstance(conversation.history, str):
-                                            history_list = json.loads(conversation.history)
-                                        elif isinstance(conversation.history, list):
-                                            history_list = conversation.history
-                                        
-                                        if history_list:
-                                            # 获取计数器数值作为参考长度
-                                            counter = 0
-                                            if plugin.msg_counter:
-                                                counter = plugin.msg_counter.get_counter(session_id)
-                                            # 如果计数器为0，默认取最近20条
-                                            fetch_len = counter if counter > 0 else 20
-
-                                            history_contents = format_context_to_string(history_list, fetch_len)
-                                            logger.info(f"✅ 使用 AstrBot 核心数据库历史作为总结源数据 (定时任务)。")
-                            except Exception as e:
-                                logger.error(f"从 AstrBot 核心数据库拉取历史失败: {e}")
-
-                        if not history_contents:
-                             logger.error(f"❌ 无法获取任何历史记录（漫游失败且核心数据库为空），跳过本次总结 (定时任务)。")
-                             continue
-                        else:
-                            logger.info(f"✅ 使用 OneBot 漫游消息作为总结源数据 (定时任务)。")
+                            logger.debug(
+                                f"🔧 [Mnemosyne] 会话 {session_id} 漫游未返回可用于总结的新消息，跳过总结。"
+                            )
+                            continue
 
                         persona_id = await _get_persona_id(
                             plugin, session_context["event"]
@@ -1287,7 +1450,9 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                         # M24 修复: 添加 msg_counter 的类型检查
                         if plugin.msg_counter:
                             plugin.msg_counter.reset_counter(session_id)
-                        plugin.context_manager.update_summary_time(session_id)
+                        plugin.context_manager.update_summary_time(
+                            session_id, roaming_latest_time
+                        )
 
                 except KeyError:
                     # 会话在获取 keys 后、处理前被删除，是正常情况
