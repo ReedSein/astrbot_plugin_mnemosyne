@@ -10,13 +10,20 @@
         "description":"Embedding 服务提供商",
         "type":"string",
         "hint":"选择用于向量嵌入的 Embedding Provider。留空则使用 AstrBot 中配置的第一个 Embedding Provider",
-        "_special":"select_embedding_provider",
         "default":""
+    },
+    "embedding_dim":{
+        "description":"Embedding 向量维度",
+        "type":"int",
+        "hint":"必须与 Embedding Provider 的输出维度一致；若已创建 Milvus 集合且维度变化，需要重建集合以避免 dimension mismatch。",
+        "obvious_hint":true,
+        "default":1024,
+        "minimum":1
     },
     "milvus_lite_path":{
         "description":"milvus数据库的lite模式路径",
         "type":"string",
-        "hint":"注意！！！只使用milvus_lite_path或者address其中一个即可，milvus_lite_path优先级较高",
+        "hint":"仅使用 milvus_lite_path 或 address 其中一个即可（milvus_lite_path 优先级更高）",
         "obvious_hint":true,
         "default":"",
         "minLength":0
@@ -24,7 +31,7 @@
     "address":{
         "description":"milvus数据库地址",
         "type":"string",
-        "hint":"支持支持格式如:http://localhost:19530，https://localhost:19530，localhost:19530",
+        "hint":"支持格式如: http://localhost:19530、https://localhost:19530、localhost:19530",
         "obvious_hint":true,
         "default":"",
         "pattern":"^(https?://)?[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*:[0-9]{1,5}$",
@@ -58,7 +65,7 @@
     "summary_check_task":{
         "description":"自动总结计时器设置",
         "type":"object",
-        "hint":"实验性功能，当长时间不和bot说话时，会进行消息总结",
+        "hint":"实验性功能：定时检查是否需要进行“漫游增量总结”。不受 num_pairs 影响；若设置了 min_messages_threshold>0，则需要 OneBot/NapCat 漫游新消息条数达到阈值才会总结。总结内容来源于 OneBot/NapCat 群聊漫游（见 onebot_roaming_settings），漫游不可用/失败则跳过本次总结。",
         "obvious_hint":true,
         "items":{
             "SUMMARY_CHECK_INTERVAL_SECONDS":{
@@ -112,11 +119,19 @@
     "num_pairs":{
         "description":"记忆总结的对话轮数",
         "type":"int",
-        "hint":"一问一答算作1轮对话。当对话轮数达到此阈值时会自动进行记忆总结。例如设置为5，表示每5轮对话（5次问答）后进行总结",
+        "hint":"用于“触发检查”的对话轮次计数（1轮=一问一答）。当轮次达到此阈值时会触发一次总结检查；若同时设置了 min_messages_threshold>0，则还需要 OneBot/NapCat 漫游的新消息条数达到阈值才会真正总结，否则本次不总结并等待下一次轮次触发再检查。",
         "obvious_hint":false,
         "default":5,
         "minimum":1,
         "maximum":25
+    },
+    "min_messages_threshold":{
+        "description":"最小消息数阈值",
+        "type":"int",
+        "hint":"按“距上次总结后的漫游新消息条数”判断是否允许总结（OneBot/NapCat 群聊漫游）。对话触发：需先满足 num_pairs 才会检查该阈值；定时任务：不受 num_pairs 影响，直接检查该阈值。达到阈值才会总结并写入长期记忆；不足则等待下一次触发再检查。0 表示不额外限制。",
+        "obvious_hint":true,
+        "default":0,
+        "minimum":0
     },
     "top_k":{
         "description":"返回的长期记忆的数量",
@@ -128,7 +143,7 @@
     "contexts_memory_len": {
         "description":"历史上下文中保留的长期记忆数量",
         "type":"int",
-        "hint":"小于0表示完全保留，大于等于0表示保留最新的对应条",
+        "hint":"<0: 完全保留；=0: 移除所有；>0: 保留最新 N 条（仅影响带 <Mnemosyne> 标签的注入内容）",
         "obvious_hint":true,
         "default":0,
         "minimum":-1
@@ -141,16 +156,16 @@
         "default": "user_prompt"
     },
     "onebot_roaming_settings": {
-        "description": "OneBot 漫游消息设置（仅用于获取总结内容，不再校正计数，适用于 NapCat/Lagrange 群聊）",
+        "description": "OneBot 漫游消息设置（NapCat/Lagrange 群聊）",
         "type": "object",
-        "hint": "开启后，自动总结时优先使用 OneBot 群聊漫游内容；仅 aiocqhttp 群聊可用，失败时回退 AstrBot 核心历史。计数器改为仅用持久化计数，不依赖漫游条数。",
+        "hint": "开启后，记忆总结的源数据将使用 OneBot 群聊漫游内容（仅 aiocqhttp 群聊可用）。插件会优先提取与机器人相关的消息（机器人发言、@bot 以及必要的上一条用户消息以补齐问答对）。漫游不可用/失败时会跳过本次总结并等待下次触发再检查。",
         "obvious_hint": true,
         "items": {
             "enable": {
                 "description": "启用漫游消息拉取（推荐开启）",
                 "type": "bool",
                 "default": true,
-                "hint": "true: 总结内容用 OneBot 群聊漫游；false: 跳过漫游，直接回退 AstrBot 核心历史。计数器不受此开关影响。"
+                "hint": "true: 自动总结内容来自 OneBot 群聊漫游；false: 不拉取漫游将导致自动总结无法获取源数据（会跳过总结）。"
             },
             "max_history_limit": {
                 "description": "最大回溯消息总数（单次总结）",
@@ -180,10 +195,39 @@
     },
     "long_memory_prompt":{
         "description":"对话总结提示词",
-        "type":"string",
+        "type":"text",
+        "hint":"用于总结对话为长期记忆的 system prompt（建议精简，避免 token 开销过大）",
+        "obvious_hint":true,
         "default":"请基于以下对话内容生成一段连贯的总结性文字，要求：1. 使用单段自然语言表述，不加序号或分点；2. 聚焦提取核心要素，包括但不限于参与者身份（姓名/角色）、核心事件、关键时间节点、特殊需求、争议点及解决方案；3. 保留涉及金额/数量/规格等量化信息；4.不输出多余的解释性内容；5. 用简洁书面语整合信息，确保信息完整准确。注意：避免添加解释性内容，仅客观呈现对话要素的整合结果。6.以AI的第一人称视角记录信息",
         "minLength":10,
         "maxLength":1000
+    },
+    "summary_llm_config":{
+        "description":"总结 LLM 调用参数",
+        "type":"dict",
+        "hint":"将作为 kwargs 传入总结用 provider 的 text_chat；不同 provider 支持的参数不同。timeout 仅用于本插件的超时控制。",
+        "items":{},
+        "default":{},
+        "template_schema":{
+            "timeout":{
+                "name":"Timeout",
+                "description":"总结超时（秒）",
+                "hint":"用于本插件的 asyncio.wait_for；不传则不额外限制",
+                "type":"float"
+            },
+            "temperature":{
+                "name":"Temperature",
+                "description":"温度参数",
+                "hint":"控制输出随机性（是否生效取决于 provider）",
+                "type":"float"
+            },
+            "max_tokens":{
+                "name":"Max Tokens",
+                "description":"最大输出 token",
+                "hint":"限制总结输出长度（是否生效取决于 provider）",
+                "type":"int"
+            }
+        }
     },
     "admin_panel":{
         "description":"管理面板安全配置",
