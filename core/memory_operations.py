@@ -297,6 +297,7 @@ async def _try_fetch_roaming_history(
     """
     [OneBot 漫游消息支持] 分页回溯获取漫游消息
     逻辑：从最新消息开始，利用 message_id 倒序向前拉取，直到时间戳衔接上 last_summary_time。
+    返回：(可用于总结的内容, 群内新消息条数, 最新群内消息时间戳)
     """
     try:
         # 1. 检查配置是否启用
@@ -434,6 +435,20 @@ async def _try_fetch_roaming_history(
             api = getattr(client, "api", None)
             self_id = str(getattr(api, "self_id", "") or "")
 
+        all_new_count = 0
+        latest_all_time = 0
+        for msg in sorted_msgs:
+            msg_time = msg.get("time", 0)
+            try:
+                msg_time_int = int(msg_time)
+            except (TypeError, ValueError):
+                msg_time_int = 0
+            if msg_time_int <= last_summary_time:
+                continue
+            all_new_count += 1
+            if msg_time_int > latest_all_time:
+                latest_all_time = msg_time_int
+
         def _is_from_bot(msg: dict, bot_id: str) -> bool:
             sender = msg.get("sender", {})
             if not isinstance(sender, dict):
@@ -554,7 +569,6 @@ async def _try_fetch_roaming_history(
                 continue
             selected[prev_idx] = True
         
-        latest_msg_time = 0
         for idx, msg in enumerate(sorted_msgs):
             if not selected[idx]:
                 continue
@@ -567,8 +581,6 @@ async def _try_fetch_roaming_history(
                 msg_time_int = int(msg_time)
             except (TypeError, ValueError):
                 msg_time_int = 0
-            if msg_time_int > latest_msg_time:
-                latest_msg_time = msg_time_int
 
             sender = msg.get("sender")
             if not isinstance(sender, dict):
@@ -600,15 +612,16 @@ async def _try_fetch_roaming_history(
         
         if filtered_history:
             logger.info(
-                f"🔧 [OneBot Roaming] 最终有效新消息: {len(filtered_history)} 条 (相关/全部={len(filtered_history)}/{len(all_raw_msgs)})"
+                f"🔧 [OneBot Roaming] 最终有效新消息: {len(filtered_history)} 条 "
+                f"(相关/群内新消息={len(filtered_history)}/{all_new_count})"
             )
             return (
                 format_context_to_string(filtered_history, len(filtered_history)),
-                len(filtered_history),
-                latest_msg_time or None,
+                all_new_count,
+                latest_all_time or None,
             )
         else:
-            return None, 0, None
+            return None, all_new_count, latest_all_time or None
             
     except Exception as e:
         logger.warning(f"🔧 [OneBot Roaming] 获取漫游消息失败: {e}")
@@ -680,7 +693,7 @@ async def _check_and_trigger_summary(
 
     if min_messages_threshold > 0 and roaming_new_count < min_messages_threshold:
         logger.info(
-            f"🔧 [Mnemosyne] 漫游新消息数 {roaming_new_count} 未达到最小阈值 "
+            f"🔧 [Mnemosyne] 群内新消息数 {roaming_new_count} 未达到最小阈值 "
             f"{min_messages_threshold}，本次不总结（等待后续触发）。"
         )
         return
@@ -706,10 +719,10 @@ async def _check_and_trigger_summary(
     logger.info(f"📊 计数器: {counter} / {pair_threshold} (消息数)")
     if min_messages_threshold > 0:
         logger.info(
-            f"📊 漫游新消息: {roaming_new_count} / {min_messages_threshold} (阈值)"
+            f"📊 群内新消息: {roaming_new_count} / {min_messages_threshold} (阈值)"
         )
     else:
-        logger.info(f"📊 漫游新消息: {roaming_new_count} (条)")
+        logger.info(f"📊 群内新消息: {roaming_new_count} (条)")
     logger.info(f"🆔 Session: {session_id}")
     logger.info("=" * 40)
 
@@ -1425,7 +1438,7 @@ async def _periodic_summarization_check(plugin: "Mnemosyne"):
                             and roaming_new_count < min_messages_threshold
                         ):
                             logger.debug(
-                                f"🔧 [Mnemosyne] 会话 {session_id} 漫游新消息数 "
+                                f"🔧 [Mnemosyne] 会话 {session_id} 群内新消息数 "
                                 f"{roaming_new_count} < 最小阈值 "
                                 f"{min_messages_threshold}，跳过总结。"
                             )
